@@ -419,13 +419,13 @@ def load_lisa_dataset(base_path):
 # ============================================================================
 
 def create_mobilenet_model(num_classes=3):
-    """Create MobileNetV2-based model - Anti-overfitting version"""
+    """Create MobileNetV2-based model - Balanced version"""
     
     base_model = keras.applications.MobileNetV2(
         input_shape=(IMG_SIZE, IMG_SIZE, 3),
         include_top=False,
         weights='imagenet',
-        alpha=0.5  # Reduced capacity
+        alpha=0.75  # Volver a capacidad media (era 0.5)
     )
     
     base_model.trainable = False
@@ -435,11 +435,13 @@ def create_mobilenet_model(num_classes=3):
     x = base_model(x, training=False)
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)
-    x = layers.Dense(128, 
+    x = layers.Dropout(0.4)(x)  # Reducido de 0.5
+    x = layers.Dense(256,  # Aumentado de 128
                      activation='relu',
-                     kernel_regularizer=regularizers.l2(0.01))(x)
-    x = layers.Dropout(0.4)(x)
+                     kernel_regularizer=regularizers.l2(0.001))(x)  # Reducido de 0.01
+    x = layers.Dropout(0.3)(x)  # Reducido de 0.4
+    x = layers.Dense(128, activation='relu')(x)  # Capa adicional sin regularización
+    x = layers.Dropout(0.2)(x)
     outputs = layers.Dense(num_classes, activation='softmax')(x)
     
     model = keras.Model(inputs, outputs)
@@ -473,13 +475,20 @@ def focal_loss(gamma=2.0, alpha=0.25):
 
 def create_augmentation_layer():
     """Create data augmentation as a Keras layer - Less aggressive"""
+    # return keras.Sequential([
+    #     layers.RandomFlip("horizontal"),
+    #     layers.RandomRotation(0.15),      # Increased from 0.05
+    #     layers.RandomZoom(0.2),           # Increased from 0.1
+    #     layers.RandomBrightness(0.25),    # Increased from 0.15
+    #     layers.RandomContrast(0.25),      # Increased from 0.15
+    #     layers.RandomTranslation(0.1, 0.1),  # NEW
+    # ], name='augmentation')
     return keras.Sequential([
         layers.RandomFlip("horizontal"),
-        layers.RandomRotation(0.15),      # Increased from 0.05
-        layers.RandomZoom(0.2),           # Increased from 0.1
-        layers.RandomBrightness(0.25),    # Increased from 0.15
-        layers.RandomContrast(0.25),      # Increased from 0.15
-        layers.RandomTranslation(0.1, 0.1),  # NEW
+        layers.RandomRotation(0.10),      # Reducido de 0.15
+        layers.RandomZoom(0.15),          # Reducido de 0.2
+        layers.RandomBrightness(0.20),    # Reducido de 0.25
+        layers.RandomContrast(0.20),      # Reducido de 0.25
     ], name='augmentation')
 
 
@@ -502,11 +511,12 @@ def train_model(X_train, y_train, X_val, y_val):
     training_model = keras.Model(inputs, outputs)
     
     training_model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-        loss=focal_loss(gamma=2.0, alpha=0.25),  # Use focal loss instead of sparse_categorical_crossentropy
+        optimizer=keras.optimizers.Adam(learning_rate=0.0001),  # Lower LR
+        loss=focal_loss(gamma=2.0, alpha=0.25),  # Focal loss handles imbalance
         metrics=['accuracy']
     )
 
+    # CAMBIO 2: Calcular class weights correctamente
     from sklearn.utils.class_weight import compute_class_weight
 
     class_weights = compute_class_weight(
@@ -516,20 +526,32 @@ def train_model(X_train, y_train, X_val, y_val):
     )
     class_weight_dict = {i: w for i, w in enumerate(class_weights)}
     
+    print(f"\nClass weights: {class_weight_dict}")
+    
     history1 = training_model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         batch_size=BATCH_SIZE,
         epochs=EPOCHS_PHASE1,
-        class_weight=None,  # class_weight=class_weight_dict,
+        #class_weight=class_weight_dict,  # USAR class weights
         callbacks=[
             keras.callbacks.EarlyStopping(
-                patience=5,  # Reduced from 10
+                patience=7,  # Aumentado de 5
                 restore_best_weights=True, 
                 monitor='val_loss', 
                 mode='min'),
-            keras.callbacks.ReduceLROnPlateau(factor=0.2, patience=5, monitor='val_loss', verbose=1, mode='min', min_lr=1e-7),
-            keras.callbacks.ModelCheckpoint('best_model_phase1.keras', save_best_only=True, monitor='val_loss', mode='min')
+            keras.callbacks.ReduceLROnPlateau(
+                factor=0.5,  # Menos agresivo (era 0.2)
+                patience=4,  # Reducido de 5
+                monitor='val_loss', 
+                verbose=1, 
+                mode='min', 
+                min_lr=1e-6),  # Aumentado de 1e-7
+            keras.callbacks.ModelCheckpoint(
+                'best_model_phase1.keras', 
+                save_best_only=True, 
+                monitor='val_loss', 
+                mode='min')
         ],
         verbose=1
     )
@@ -537,37 +559,54 @@ def train_model(X_train, y_train, X_val, y_val):
     print("\n" + "="*50)
     print("PHASE 2: Fine-tuning base model")
     print("="*50)
-    
+
     # Unfreeze for fine-tuning
     base_model.trainable = True
-    
-    # Freeze early layers
-    for layer in base_model.layers[:100]:
+
+    # Freeze early layers - MORE layers this time
+    for layer in base_model.layers[:100]:  # Freeze MORE layers (was 80)
         layer.trainable = False
-    
+
+    # CRITICAL: Use SAME loss as Phase 1 (focal loss)
+    # CRITICAL: Much LOWER learning rate
     training_model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE/20),  # Even lower LR for fine-tuning
-        loss=focal_loss(gamma=2.0, alpha=0.25),  # Continue using focal loss
+        optimizer=keras.optimizers.Adam(learning_rate=1e-5),  # 10x lower than Phase 1
+        loss=focal_loss(gamma=2.0, alpha=0.25),  # SAME as Phase 1
         metrics=['accuracy']
     )
-    
+
+    # NO class weights in Phase 2 - focal loss already handles imbalance
     history2 = training_model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         batch_size=BATCH_SIZE,
         epochs=EPOCHS_PHASE2,
-        class_weight=None,  # Don't use class weights with focal loss
+        # NO class_weight parameter
         callbacks=[
-            keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True, monitor='val_loss', mode='min'),
-            keras.callbacks.ReduceLROnPlateau(factor=0.2, patience=6, monitor='val_loss', verbose=1, mode='min', min_lr=1e-7),
-            keras.callbacks.ModelCheckpoint('best_model_phase2.keras', save_best_only=True, monitor='val_loss', mode='min')
+            keras.callbacks.EarlyStopping(
+                patience=15,  # More patience for fine-tuning
+                restore_best_weights=True, 
+                monitor='val_accuracy',  # Switch to accuracy
+                mode='max'),
+            keras.callbacks.ReduceLROnPlateau(
+                factor=0.5,
+                patience=5,
+                monitor='val_accuracy',  # Switch to accuracy
+                verbose=1, 
+                mode='max', 
+                min_lr=1e-7),
+            keras.callbacks.ModelCheckpoint(
+                'best_model_phase2.keras', 
+                save_best_only=True, 
+                monitor='val_accuracy',  # Switch to accuracy
+                mode='max')
         ],
         verbose=1
     )
     
     # Compile the base model for inference (without augmentation)
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE/20),
+        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE/10),
         loss=focal_loss(gamma=2.0, alpha=0.25),
         metrics=['accuracy']
     )
@@ -637,6 +676,36 @@ def evaluate_tflite_model(tflite_model, X_test, y_test):
     print(f"TFLite Model Accuracy: {accuracy*100:.2f}%")
     
     return accuracy
+
+def evaluate_model(model, X_test, y_test, class_names):
+    """Evaluate model performance with classification report and confusion matrix"""
+    from sklearn.metrics import classification_report, confusion_matrix
+
+    # If y_test is already integer‑encoded (0..num_classes-1), skip LabelEncoder
+    # Otherwise, encode to integers
+    from sklearn.preprocessing import LabelEncoder
+    le = LabelEncoder()
+    y_test_encoded = le.fit_transform(y_test)
+
+    # Evaluate directly with sparse labels (no one-hot)
+    test_loss, test_acc = model.evaluate(X_test, y_test_encoded, verbose=0)
+    print(f"Test accuracy: {test_acc:.4f}")
+
+    # Predictions
+    y_pred = model.predict(X_test)
+    y_pred_classes = np.argmax(y_pred, axis=1)
+
+    # Classification report
+    print("\nClassification Report:")
+    print(classification_report(y_test_encoded, y_pred_classes,
+                                target_names=class_names))
+
+    # Confusion matrix
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(y_test_encoded, y_pred_classes)
+    print(cm)
+
+    return test_acc, cm
 
 
 def test_random_samples(tflite_model, X_test, y_test, num_samples=30):
@@ -862,8 +931,8 @@ def main():
     model, history1, history2 = train_model(X_train, y_train, X_val, y_val)
     
     # Solo aplicar OV2640 al test set
-    print("\nAplicando OV2640 preprocessing solo a test set...")
-    X_test = preprocess_images_for_ov2640(X_test, severity=0.15)
+    #print("\nAplicando OV2640 preprocessing solo a test set...")
+    #X_test = preprocess_images_for_ov2640(X_test, severity=0.15)
     
     # Resto del código...
     plot_training_history(history1, history2)
@@ -871,7 +940,9 @@ def main():
     print("\n" + "="*60)
     print("Evaluating on test set...")
     test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    test_acc, cm = evaluate_model(model, X_test, y_test, CLASS_NAMES)
     print(f"Test Accuracy: {test_acc*100:.2f}%")
+    print(f"Confusion Matrix:\n {cm}")
     
     tflite_model = convert_to_tflite(model, X_test)
     tflite_acc = evaluate_tflite_model(tflite_model, X_test, y_test)
