@@ -1,0 +1,7 @@
+pip install tensorflow[and-cuda]==2.19.0
+pip install numpy==1.26.4
+pip install pandas==2.2.2
+pip install opencv-python==4.10.0.84
+pip install scikit-learn==1.5.1
+pip install matplotlib==3.9.2
+pip install Pillow==10.4.0
