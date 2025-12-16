@@ -27,9 +27,9 @@ GRID_SIZE = 8  # Divide image into 8x8 grid
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 EPOCHS = 1
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005 # reduced from 0.001
 IOU_THRESHOLD = 0.3
 CONF_THRESHOLD = 0.5
 MAX_SAMPLES = 1000  # Limit total samples to prevent memory issues
@@ -410,10 +410,10 @@ def create_detection_model(num_classes):
     # Detection head
     x = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.3)(x)  # testing
+    x = layers.Dropout(0.5)(x)  # testing
     x = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.3)(x)  # testing
+    x = layers.Dropout(0.5)(x)  # testing
     
     # Resize to grid
     x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
@@ -505,8 +505,8 @@ def train_model(model, train_data, val_data, train_loader, val_loader):
             save_best_only=True,
             verbose=1
         ),
-        MAPCallback(val_data, val_loader, train_loader.class_names),
-        DetectionPreview(val_data, val_loader, num_samples=3)
+        # MAPCallback(val_data, val_loader, train_loader.class_names),
+        DetectionPreview(val_data, val_loader, num_samples=6)
     ]
     
     # Create generators
@@ -621,18 +621,61 @@ def compute_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0
 
 
-def convert_to_tflite(model, output_path='traffic_light_detector.tflite'):
-    """Convert to TFLite with optimizations"""
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    converter.target_spec.supported_types = [tf.float32]
+# def convert_to_tflite(model, output_path='traffic_light_detector.tflite'):
+#     """Convert to TFLite with optimizations"""
+#     converter = tf.lite.TFLiteConverter.from_keras_model(model)
+#     converter.optimizations = [tf.lite.Optimize.DEFAULT]
+#     converter.target_spec.supported_types = [tf.float32]
     
+#     tflite_model = converter.convert()
+    
+#     with open(output_path, 'wb') as f:
+#         f.write(tflite_model)
+    
+#     print(f"\nTFLite model saved: {output_path}")
+#     print(f"Model size: {len(tflite_model) / 1024:.2f} KB")
+    
+#     return output_path
+
+def convert_to_tflite(model, train_data, loader, output_path='traffic_light_detector.tflite', num_calibration_samples=250):
+    """Convert to TFLite with INT8 quantization"""
+    
+    # Representative dataset generator for calibration
+    def representative_dataset():
+        """Generate representative samples for quantization calibration"""
+        calibration_samples = random.sample(train_data, min(num_calibration_samples, len(train_data)))
+        
+        for item in calibration_samples:
+            img = loader.preprocess_image(item['img_path'], item['apply_calibration'])
+            if img is None:
+                continue
+            
+            # Normalize and add batch dimension
+            img_normalized = np.expand_dims(img / 255.0, axis=0).astype(np.float32)
+            yield [img_normalized]
+    
+    # Create converter
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    
+    # Enable INT8 quantization
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_dataset
+    
+    # Enforce full integer quantization
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.uint8  # or tf.int8
+    converter.inference_output_type = tf.uint8  # or tf.int8
+    
+    # Convert model
+    print("Converting to INT8 quantized TFLite model...")
+    print(f"Using {num_calibration_samples} calibration samples...")
     tflite_model = converter.convert()
     
+    # Save model
     with open(output_path, 'wb') as f:
         f.write(tflite_model)
     
-    print(f"\nTFLite model saved: {output_path}")
+    print(f"\nINT8 TFLite model saved: {output_path}")
     print(f"Model size: {len(tflite_model) / 1024:.2f} KB")
     
     return output_path
@@ -717,12 +760,34 @@ def evaluate_map(results, class_names, iou_threshold=0.5, img_width=IMG_WIDTH, i
     return aps, map_score
 
 def test_tflite_model(tflite_path, test_data, class_names, num_samples=30):
-    """Test TFLite detection model on random samples"""
+    """Test TFLite detection model (handles both float32 and int8 quantized models)"""
     interpreter = tf.lite.Interpreter(model_path=tflite_path)
     interpreter.allocate_tensors()
     
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
+    
+    # Check model type
+    input_dtype = input_details[0]['dtype']
+    output_dtype = output_details[0]['dtype']
+    is_quantized = input_dtype == np.uint8 or input_dtype == np.int8
+    is_float16 = input_dtype == np.float16
+    
+    if is_quantized:
+        print(f"Detected INT8 quantized model")
+        print(f"Input type: {input_dtype}, Output type: {output_dtype}")
+        
+        # Get quantization parameters
+        input_scale, input_zero_point = input_details[0]['quantization']
+        output_scale, output_zero_point = output_details[0]['quantization']
+        print(f"Input scale: {input_scale}, zero_point: {input_zero_point}")
+        print(f"Output scale: {output_scale}, zero_point: {output_zero_point}")
+    elif is_float16:
+        print(f"Detected FLOAT16 model")
+        print(f"Input type: {input_dtype}, Output type: {output_dtype}")
+    else:
+        print(f"Detected FLOAT32 model")
+        print(f"Input type: {input_dtype}, Output type: {output_dtype}")
     
     loader = LISADetectionDataLoader(DATASET_ROOT, ANNOTATIONS_ROOT)
     
@@ -734,6 +799,75 @@ def test_tflite_model(tflite_path, test_data, class_names, num_samples=30):
     print(f"{'='*80}\n")
     
     results = []
+    
+    for idx, item in enumerate(random_samples):
+        img = loader.preprocess_image(item['img_path'], item['apply_calibration'])
+        
+        if img is None:
+            continue
+        
+        # Prepare input based on model type
+        if is_quantized:
+            # For quantized models: normalize to [0, 255] then quantize
+            img_normalized = img.astype(np.float32)  # Already in [0, 255] range
+            
+            # Quantize: scale and add zero point
+            input_data = (img_normalized / input_scale + input_zero_point).astype(input_dtype)
+            input_data = np.expand_dims(input_data, axis=0)
+        elif is_float16:
+            # For float16 models: normalize to [0, 1] and cast to float16
+            input_data = np.expand_dims(img / 255.0, axis=0).astype(np.float16)
+        else:
+            # For float32 models: normalize to [0, 1]
+            input_data = np.expand_dims(img / 255.0, axis=0).astype(np.float32)
+        
+        # Run inference
+        interpreter.set_tensor(input_details[0]['index'], input_data)
+        interpreter.invoke()
+        predictions = interpreter.get_tensor(output_details[0]['index'])[0]
+        
+        # Dequantize output if needed
+        if is_quantized:
+            # Dequantize: (quantized_value - zero_point) * scale
+            predictions = (predictions.astype(np.float32) - output_zero_point) * output_scale
+        elif is_float16:
+            # Convert float16 to float32 for processing
+            predictions = predictions.astype(np.float32)
+        
+        # Decode predictions
+        boxes = decode_predictions(predictions)
+        boxes = non_max_suppression(boxes)
+        
+        # Count detections per class
+        detections = {}
+        for box in boxes:
+            class_id = int(box[5])
+            class_name = class_names[class_id]
+            detections[class_name] = detections.get(class_name, 0) + 1
+        
+        # Ground truth count
+        gt_count = len(item['boxes'])
+        pred_count = len(boxes)
+        
+        results.append({
+            'filename': item['filename'],
+            'ground_truth_count': gt_count,
+            'predicted_count': pred_count,
+            'detections': detections,
+            'boxes': boxes,
+            'image': img,
+            'gt_boxes': item['boxes'],
+            'orig_w': item['orig_w'],
+            'orig_h': item['orig_h']
+        })
+        
+        # Print result
+        det_str = ', '.join([f"{k}:{v}" for k, v in detections.items()]) if detections else "none"
+        print(f"{idx+1:2d}. {item['filename']:35s} | GT: {gt_count} | Pred: {pred_count} | {det_str}")
+    
+    print(f"\n{'='*80}\n")
+    
+    return results
     
     for idx, item in enumerate(random_samples):
         img = loader.preprocess_image(item['img_path'], item['apply_calibration'])
@@ -884,7 +1018,8 @@ def main():
     
     # Convert to TFLite
     print("\n[5/6] Converting to TFLite...")
-    tflite_path = convert_to_tflite(model)
+    # tflite_path = convert_to_tflite(model)
+    tflite_path = convert_to_tflite(model, train_items, loader)
     
     # Test
     print("\n[6/6] Testing detection model...")
