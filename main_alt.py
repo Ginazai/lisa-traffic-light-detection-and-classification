@@ -95,10 +95,12 @@ class DetectionPreview(keras.callbacks.Callback):
                 'filename': item['filename'],
                 'ground_truth_count': len(item['boxes']),
                 'predicted_count': len(boxes),
-                'detections': {self.loader.class_names[b[5]]: 1 for b in boxes},  # quick count
+                'detections': {self.loader.class_names[b[5]]: 1 for b in boxes},
                 'boxes': boxes,
                 'image': img,
-                'gt_boxes': item['boxes']
+                'gt_boxes': item['boxes'],
+                'orig_w': item['orig_w'], 
+                'orig_h': item['orig_h']   
             })
 
         visualize_detections(results, num_display=self.num_samples)
@@ -943,31 +945,44 @@ def visualize_detections(results, num_display=6):
         ax = axes[idx]
         ax.imshow(result['image'])
         
-        # Draw ground truth (green)
-        orig_h, orig_w = result['image'].shape[:2]
-        scale_x = IMG_WIDTH / orig_w
-        scale_y = IMG_HEIGHT / orig_h
+        # Get ORIGINAL dimensions (before resize)
+        orig_w = result.get('orig_w')
+        orig_h = result.get('orig_h')
         
+        if orig_w is None or orig_h is None:
+            # Fallback: assume standard LISA dimensions
+            orig_w, orig_h = 1280, 960
+        
+        # Scale factors: original -> resized
+        scale_x = IMG_WIDTH / orig_w   # e.g., 640/1280 = 0.5
+        scale_y = IMG_HEIGHT / orig_h  # e.g., 480/960 = 0.5
+        
+        # Draw ground truth (green) - boxes are in ORIGINAL coordinates
         for box in result['gt_boxes']:
-            x1, y1 = box['x1'], box['y1']
-            x2, y2 = box['x2'], box['y2']
-            # Scale to displayed image size using actual dimensions
-            x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
-            y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
+            x1 = int(box['x1'] * scale_x)
+            y1 = int(box['y1'] * scale_y)
+            x2 = int(box['x2'] * scale_x)
+            y2 = int(box['y2'] * scale_y)
+            
             # Clip to image bounds
-            x1, x2 = max(0, min(IMG_WIDTH, x1)), max(0, min(IMG_WIDTH, x2))
-            y1, y2 = max(0, min(IMG_HEIGHT, y1)), max(0, min(IMG_HEIGHT, y2))
+            x1 = max(0, min(IMG_WIDTH, x1))
+            y1 = max(0, min(IMG_HEIGHT, y1))
+            x2 = max(0, min(IMG_WIDTH, x2))
+            y2 = max(0, min(IMG_HEIGHT, y2))
+            
             w, h = x2 - x1, y2 - y1
             rect = patches.Rectangle((x1, y1), w, h, linewidth=2,
                                      edgecolor='green', facecolor='none', label='GT')
             ax.add_patch(rect)
         
-        # Draw predictions (red)
+        # Draw predictions (red) - already in resized coordinates
         for box in result['boxes']:
             x1, y1, x2, y2, conf, class_id = box
-            # Clip predictions too
-            x1, x2 = max(0, min(IMG_WIDTH, x1)), max(0, min(IMG_WIDTH, x2))
-            y1, y2 = max(0, min(IMG_HEIGHT, y1)), max(0, min(IMG_HEIGHT, y2))
+            x1 = max(0, min(IMG_WIDTH, x1))
+            y1 = max(0, min(IMG_HEIGHT, y1))
+            x2 = max(0, min(IMG_WIDTH, x2))
+            y2 = max(0, min(IMG_HEIGHT, y2))
+            
             w, h = x2 - x1, y2 - y1
             rect = patches.Rectangle((x1, y1), w, h, linewidth=2,
                                      edgecolor='red', facecolor='none')
@@ -983,7 +998,7 @@ def visualize_detections(results, num_display=6):
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     plt.savefig(f'detection_results-{timestamp}.png', dpi=150, bbox_inches='tight')
-    print("Visualization saved: detection_results.png")
+    print(f"Visualization saved: detection_results-{timestamp}.png")
     plt.close()
 
 
