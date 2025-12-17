@@ -240,9 +240,7 @@ class LISADetectionDataLoader:
     
     def encode_ground_truth(self, boxes, img_width, img_height):
         """
-        Encode ground truth boxes into grid format
-        Output shape: [GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + NUM_CLASSES]
-        Each cell predicts: [objectness, x, y, w, h, class_probs...]
+        YOLO-style anchor-based encoding
         """
         target = np.zeros((GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + self.num_classes))
         
@@ -254,8 +252,8 @@ class LISADetectionDataLoader:
             x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
             x_center = ((x1 + x2) / 2) / img_width
             y_center = ((y1 + y2) / 2) / img_height
-            w = (x2 - x1) / img_width
-            h = (y2 - y1) / img_height
+            box_w = (x2 - x1) / img_width
+            box_h = (y2 - y1) / img_height
             
             # Find grid cell
             grid_x = int(x_center * GRID_SIZE)
@@ -269,7 +267,9 @@ class LISADetectionDataLoader:
             for anchor_idx, anchor in enumerate(ANCHORS):
                 anchor_w = anchor[0] / GRID_SIZE
                 anchor_h = anchor[1] / GRID_SIZE
-                iou = min(w, anchor_w) * min(h, anchor_h) / (max(w, anchor_w) * max(h, anchor_h))
+                intersection = min(box_w, anchor_w) * min(box_h, anchor_h)
+                union = box_w * box_h + anchor_w * anchor_h - intersection
+                iou = intersection / union if union > 0 else 0
                 if iou > best_iou:
                     best_iou = iou
                     best_anchor = anchor_idx
@@ -278,13 +278,19 @@ class LISADetectionDataLoader:
             cell_x = x_center * GRID_SIZE - grid_x
             cell_y = y_center * GRID_SIZE - grid_y
             
+            # YOLO-style: encode as log(box_size / anchor_size)
+            anchor_w = ANCHORS[best_anchor][0] / GRID_SIZE
+            anchor_h = ANCHORS[best_anchor][1] / GRID_SIZE
+            tw = np.log(box_w / anchor_w + 1e-16)
+            th = np.log(box_h / anchor_h + 1e-16)
+            
             # Encode target
             class_idx = self.class_to_idx[box['class']]
-            target[grid_y, grid_x, best_anchor, 0] = 1.0  # Objectness
+            target[grid_y, grid_x, best_anchor, 0] = 1.0
             target[grid_y, grid_x, best_anchor, 1] = cell_x
             target[grid_y, grid_x, best_anchor, 2] = cell_y
-            target[grid_y, grid_x, best_anchor, 3] = w * GRID_SIZE
-            target[grid_y, grid_x, best_anchor, 4] = h * GRID_SIZE
+            target[grid_y, grid_x, best_anchor, 3] = tw
+            target[grid_y, grid_x, best_anchor, 4] = th
             target[grid_y, grid_x, best_anchor, 5 + class_idx] = 1.0
         
         return target
@@ -528,11 +534,14 @@ def train_model(model, train_data, val_data, train_loader, val_loader):
 
 
 def decode_predictions(predictions, conf_threshold=CONF_THRESHOLD):
+    """
+    YOLO-style decoding with anchors
+    """
     boxes = []
-
+    
     if isinstance(predictions, tf.Tensor):
         predictions = predictions.numpy()
-
+    
     for i in range(GRID_SIZE):
         for j in range(GRID_SIZE):
             for a in range(NUM_ANCHORS):
@@ -541,45 +550,51 @@ def decode_predictions(predictions, conf_threshold=CONF_THRESHOLD):
                 obj_conf = 1 / (1 + np.exp(-np.clip(raw_obj, -10, 10)))
                 if obj_conf < conf_threshold:
                     continue
-
-                # Position offsets (sigmoid keeps them in [0,1])
-                cell_x = 1 / (1 + np.exp(-np.clip(predictions[i, j, a, 1], -10, 10)))
-                cell_y = 1 / (1 + np.exp(-np.clip(predictions[i, j, a, 2], -10, 10)))
-
-                # Width/height: use exp with clipping to prevent overflow
-                w = np.exp(np.clip(predictions[i, j, a, 3], -10, 10)) / GRID_SIZE
-                h = np.exp(np.clip(predictions[i, j, a, 4], -10, 10)) / GRID_SIZE
-
-                # Convert to image coordinates
+                
+                # Cell offsets
+                tx = predictions[i, j, a, 1]
+                ty = predictions[i, j, a, 2]
+                cell_x = 1 / (1 + np.exp(-np.clip(tx, -10, 10)))
+                cell_y = 1 / (1 + np.exp(-np.clip(ty, -10, 10)))
+                
+                # Width/height with anchors
+                tw = np.clip(predictions[i, j, a, 3], -10, 10)
+                th = np.clip(predictions[i, j, a, 4], -10, 10)
+                
+                anchor_w = ANCHORS[a][0] / GRID_SIZE
+                anchor_h = ANCHORS[a][1] / GRID_SIZE
+                
+                box_w = anchor_w * np.exp(tw)
+                box_h = anchor_h * np.exp(th)
+                
+                # Convert to image coords
                 x_center = (j + cell_x) / GRID_SIZE
                 y_center = (i + cell_y) / GRID_SIZE
-                width = w
-                height = h
-
-                x1 = int((x_center - width / 2) * IMG_WIDTH)
-                y1 = int((y_center - height / 2) * IMG_HEIGHT)
-                x2 = int((x_center + width / 2) * IMG_WIDTH)
-                y2 = int((y_center + height / 2) * IMG_HEIGHT)
-
-                # Clip to image bounds
-                x1, x2 = max(0, min(IMG_WIDTH, x1)), max(0, min(IMG_WIDTH, x2))
-                y1, y2 = max(0, min(IMG_HEIGHT, y1)), max(0, min(IMG_HEIGHT, y2))
-
-                # Class probabilities
+                
+                x1 = int((x_center - box_w / 2) * IMG_WIDTH)
+                y1 = int((y_center - box_h / 2) * IMG_HEIGHT)
+                x2 = int((x_center + box_w / 2) * IMG_WIDTH)
+                y2 = int((y_center + box_h / 2) * IMG_HEIGHT)
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                x1 = max(0, min(IMG_WIDTH, x1))
+                y1 = max(0, min(IMG_HEIGHT, y1))
+                x2 = max(0, min(IMG_WIDTH, x2))
+                y2 = max(0, min(IMG_HEIGHT, y2))
+                
+                # Classes
                 class_logits = predictions[i, j, a, 5:]
                 class_probs = 1 / (1 + np.exp(-np.clip(class_logits, -10, 10)))
                 class_id = np.argmax(class_probs)
                 class_conf = class_probs[class_id]
-
+                
                 confidence = obj_conf * class_conf
-                boxes.append((x1, y1, x2, y2, confidence, class_id))
-
-    # Debug: log how many boxes passed threshold
-    print(f"Decoded {len(boxes)} boxes above threshold {conf_threshold}")
-
+                boxes.append((x1, y1, x2, y2, confidence, int(class_id)))
+    
     return boxes
-
-
+    
 def non_max_suppression(boxes, iou_threshold=IOU_THRESHOLD):
     """Apply NMS to remove overlapping boxes"""
     if len(boxes) == 0:
@@ -966,7 +981,8 @@ def visualize_detections(results, num_display=6):
         ax.axis('off')
     
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig(f'detection_results-{datetime.fromtimestamp(datetime.now().timestamp())}.png', dpi=150, bbox_inches='tight')
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    plt.savefig(f'detection_results-{timestamp}.png', dpi=150, bbox_inches='tight')
     print("Visualization saved: detection_results.png")
     plt.close()
 
@@ -1016,6 +1032,14 @@ def main():
     # Train using generators (memory efficient)
     print("\n[4/6] Training model (using data generators)...")
     history = train_model(model, train_items, val_items, loader, loader)
+
+    # Test Keras model directly
+    print("\n[Testing Keras model directly]")
+    test_item = random.choice(test_items)
+    img = loader.preprocess_image(test_item['img_path'], True)
+    preds = model.predict(np.expand_dims(img/255.0, axis=0))[0]
+    boxes = decode_predictions(preds, conf_threshold=0.3)
+    print(f"Keras model found {len(boxes)} boxes")
     
     # Convert to TFLite
     print("\n[5/6] Converting to TFLite...")
