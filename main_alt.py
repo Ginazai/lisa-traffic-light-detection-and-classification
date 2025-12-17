@@ -24,39 +24,47 @@ from datetime import datetime
 # Configuration
 IMG_HEIGHT = 480
 IMG_WIDTH = 640
-GRID_SIZE = 8  # Divide image into 8x8 grid
+GRID_SIZE = 16  # Divide image into 8x8 grid
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
 BATCH_SIZE = 8
 EPOCHS = 15
-LEARNING_RATE = 0.0005 # reduced from 0.001
-IOU_THRESHOLD = 0.3
-CONF_THRESHOLD = 0.3
-MAX_SAMPLES = 10000  # Limit total samples to prevent memory issues
+LEARNING_RATE = 0.0001 # reduced from 0.001
+IOU_THRESHOLD = 0.75
+CONF_THRESHOLD = 0.75
+MAX_SAMPLES = 20000  # Limit total samples to prevent memory issues
 
 # Dataset paths
 DATASET_ROOT = "LISA Traffic Light Dataset"
 ANNOTATIONS_ROOT = os.path.join(DATASET_ROOT, "Annotations", "Annotations")
 
 # Anchor boxes (width, height) normalized to cell size
+# ANCHORS = np.array([
+#     [0.2, 0.6],   # New smaller anchor for tiny/distant lights
+#     [0.3, 0.8],   # Tall thin traffic light
+#     [0.5, 1.2],   # Medium traffic light
+#     [0.7, 1.5]    # Large traffic light
+# ])
 ANCHORS = np.array([
-    [0.2, 0.6],   # New smaller anchor for tiny/distant lights
-    [0.3, 0.8],   # Tall thin traffic light
-    [0.5, 1.2],   # Medium traffic light
-    [0.7, 1.5]    # Large traffic light
+    [0.1, 0.3],
+    [0.15, 0.4],
+    [0.25, 0.6],
+    [0.35, 0.75]
 ])
 
-
-def apply_ov2640_color_calibration(image):
-    """Apply color calibration to match OV2640 camera characteristics"""
+def apply_ov2640_color_calibration(image, add_noise=True):
+    """Apply color calibration to match OV2640 camera characteristics.
+    If `add_noise` is False, no random sensor noise will be applied
+    (useful for deterministic validation / evaluation).
+    """
     image = image.astype(np.float32) / 255.0
-    
+
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
     hsv[:, :, 1] = hsv[:, :, 1] * 0.9  # Reduce saturation
     hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.1, 0, 1)  # Increase brightness
     image = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-    
+
     # Warmer tone
     color_matrix = np.array([
         [1.05, 0.00, 0.00],
@@ -65,11 +73,12 @@ def apply_ov2640_color_calibration(image):
     ])
     image = np.dot(image, color_matrix.T)
     image = np.clip(image, 0, 1)
-    
-    # Add sensor noise
-    noise = np.random.normal(0, 0.01, image.shape)
-    image = np.clip(image + noise, 0, 1)
-    
+
+    # Add sensor noise only when requested
+    if add_noise:
+        noise = np.random.normal(0, 0.01, image.shape)
+        image = np.clip(image + noise, 0, 1)
+
     return (image * 255).astype(np.uint8)
 
 class DetectionPreview(keras.callbacks.Callback):
@@ -95,10 +104,12 @@ class DetectionPreview(keras.callbacks.Callback):
                 'filename': item['filename'],
                 'ground_truth_count': len(item['boxes']),
                 'predicted_count': len(boxes),
-                'detections': {self.loader.class_names[b[5]]: 1 for b in boxes},  # quick count
+                'detections': {self.loader.class_names[b[5]]: 1 for b in boxes},
                 'boxes': boxes,
                 'image': img,
-                'gt_boxes': item['boxes']
+                'gt_boxes': item['boxes'],
+                'orig_w': item['orig_w'], 
+                'orig_h': item['orig_h']   
             })
 
         visualize_detections(results, num_display=self.num_samples)
@@ -169,12 +180,25 @@ class LISADetectionDataLoader:
             if filename not in grouped:
                 grouped[filename] = []
             
+            # Normalize class/annotation tag so it matches `self.class_names`
+            raw_tag = str(row['Annotation tag']).strip()
+            matched_label = None
+            for cname in self.class_names:
+                # compare case-insensitive and ignore spaces/hyphens
+                if raw_tag.lower().replace(' ', '').replace('-', '') == cname.lower().replace(' ', '').replace('-', ''):
+                    matched_label = cname
+                    break
+
+            if matched_label is None:
+                # keep raw tag (it may be filtered later if unknown)
+                matched_label = raw_tag
+
             annotation = {
                 'x1': int(row['Upper left corner X']),
                 'y1': int(row['Upper left corner Y']),
                 'x2': int(row['Lower right corner X']),
                 'y2': int(row['Lower right corner Y']),
-                'class': row['Annotation tag']
+                'class': matched_label
             }
             grouped[filename].append(annotation)
         
@@ -298,15 +322,39 @@ class LISADetectionDataLoader:
     def preprocess_image(self, img_path, apply_calibration=True):
         """Load and preprocess full image"""
         img = cv2.imread(img_path)
+        
         if img is None:
             return None
-        
+
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
-        
+
         if apply_calibration:
-            img = apply_ov2640_color_calibration(img)
-        
+            # Photometric augmentations only (do NOT change geometry unless boxes are transformed)
+            img = apply_ov2640_color_calibration(img, add_noise=True)
+            # Augmentation
+            # Random brightness jitter
+            if random.random() < 0.5:
+                factor = 1.0 + np.random.uniform(-0.2, 0.2)
+                img = np.clip(img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+
+            # Random HSV/value jitter
+            if random.random() < 0.5:
+                hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+                hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1.0 + np.random.uniform(-0.15, 0.15)), 0, 255)
+                hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + np.random.uniform(-0.1, 0.1)), 0, 255)
+                img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+            # Small Gaussian blur sometimes
+            if random.random() < 0.3:
+                k = random.choice([3, 5])
+                img = cv2.GaussianBlur(img, (k, k), 0)
+
+            # Add small Gaussian noise
+            if random.random() < 0.3:
+                noise = np.random.normal(0, 4, img.shape).astype(np.float32)
+                img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
         return img
     
     def create_dataset(self, data, apply_calibration=True):
@@ -406,21 +454,32 @@ def create_detection_model(num_classes):
         alpha=0.5  # Reduced width for efficiency
     )
     
-    # Fine-tune last layers
+   # Fine-tune last layers
     backbone.trainable = True
-    for layer in backbone.layers[:-20]:
+    for layer in backbone.layers[:-100]:
         layer.trainable = False
-    
+
     # Extract features
     x = backbone(inputs, training=False)
-    
-    # Detection head
-    x = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
+
+    # Detection head with stronger regularization
+    # reg = keras.regularizers.l2(1e-4)
+    reg = keras.regularizers.l2(5e-4)
+    x = layers.Conv2D(256, 3, padding='same', activation='relu',
+                    kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.2)(x)  # testing
-    x = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Conv2D(128, 3, padding='same', activation='relu',
+                    kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.2)(x)  # testing
+    x = layers.Dropout(0.5)(x)
+
+    # Resize to grid
+    x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
+
+    # Final prediction: [GRID_SIZE, GRID_SIZE, NUM_ANCHORS * (5 + NUM_CLASSES)]
+    x = layers.Conv2D(NUM_ANCHORS * (5 + num_classes), 1, padding='same',
+                    kernel_regularizer=reg)(x)
     
     # Resize to grid
     x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
@@ -441,43 +500,46 @@ def detection_loss(y_true, y_pred):
     Custom detection loss function
     Combines: objectness loss + bbox regression loss + classification loss
     """
-    # Split predictions
-    obj_true = y_true[..., 0:1]  # [B, G, G, A, 1]
-    box_true = y_true[..., 1:5]  # [B, G, G, A, 4]
-    cls_true = y_true[..., 5:]   # [B, G, G, A, C]
-    
+    epsilon = 1e-7
+    # Split predictions / ground truth
+    obj_true = y_true[..., 0:1]
+    box_true = y_true[..., 1:5]
+    cls_true = y_true[..., 5:]
+
+    # Predicted: apply sigmoid for objectness and class logits
     obj_pred = tf.sigmoid(y_pred[..., 0:1])
-    box_pred = y_pred[..., 1:5]
     cls_pred = tf.sigmoid(y_pred[..., 5:])
-    
-    # Object mask (where object exists)
+
+    # For box predictions: tx,ty should be sigmoided to match cell offsets in [0,1]
+    tx_ty_pred = tf.sigmoid(y_pred[..., 1:3])
+    tw_th_pred = y_pred[..., 3:5]
+    box_pred = tf.concat([tx_ty_pred, tw_th_pred], axis=-1)
+
+    # Masks
     obj_mask = obj_true
     noobj_mask = 1 - obj_true
-    
-    # Objectness loss (binary cross-entropy manually computed to preserve shape)
-    epsilon = 1e-7
+
+    # Objectness BCE
     obj_pred_clipped = tf.clip_by_value(obj_pred, epsilon, 1 - epsilon)
     obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
-    
     obj_loss = obj_mask * obj_bce
     noobj_loss = noobj_mask * obj_bce
-    objectness_loss = tf.reduce_mean(obj_loss + 0.5 * noobj_loss)
-    
-    # Box regression loss (only where objects exist)
+    objectness_loss = tf.reduce_mean(obj_loss + 5.0 * noobj_loss)
+
+    # Box regression (only where objects exist)
     box_diff = box_true - box_pred
     box_loss = obj_mask * tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
     box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
-    
-    # Classification loss (binary cross-entropy for multi-label)
+
+    # Classification BCE (only where objects exist)
     cls_pred_clipped = tf.clip_by_value(cls_pred, epsilon, 1 - epsilon)
     cls_bce = -(cls_true * tf.math.log(cls_pred_clipped) + (1 - cls_true) * tf.math.log(1 - cls_pred_clipped))
     cls_loss = obj_mask * tf.reduce_mean(cls_bce, axis=-1, keepdims=True)
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
-    
-    # Total loss with weights
-    # total_loss = 5.0 * box_loss + objectness_loss + cls_loss
-    total_loss = 5.0 * box_loss + objectness_loss + 0.5 * cls_loss
-    
+
+    # Total loss
+    total_loss = 5.0 * box_loss + objectness_loss + 0.2 * cls_loss
+
     return total_loss
 
 
@@ -512,7 +574,7 @@ def train_model(model, train_data, val_data, train_loader, val_loader):
             save_best_only=True,
             verbose=1
         ),
-        # MAPCallback(val_data, val_loader, train_loader.class_names),
+        MAPCallback(val_data, val_loader, train_loader.class_names),
         DetectionPreview(val_data, val_loader, num_samples=6)
     ]
     
@@ -697,83 +759,109 @@ def convert_to_tflite(model, train_data, loader, output_path='traffic_light_dete
     return output_path
 
 def evaluate_map(results, class_names, iou_threshold=0.5, img_width=IMG_WIDTH, img_height=IMG_HEIGHT):
-    """Compute mAP per class from detection results with proper scaling and class alignment"""
-    aps = {}
-    
-    # Build class lookup
-    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
-    
-    for class_id, class_name in enumerate(class_names):
-        preds = []
-        gts = []
-        
-        for result in results:
-            orig_w = result.get('orig_w')
-            orig_h = result.get('orig_h')
-            if orig_w is None or orig_h is None:
-                orig_h, orig_w = result['image'].shape[:2]
-            
-            # Scale GT boxes to resized image space
-            for gt in result['gt_boxes']:
-                if gt['class'] != class_name:
-                    continue
-                scaled_gt = {
-                    'x1': int(gt['x1'] * img_width / orig_w),
-                    'y1': int(gt['y1'] * img_height / orig_h),
-                    'x2': int(gt['x2'] * img_width / orig_w),
-                    'y2': int(gt['y2'] * img_height / orig_h),
-                    'class_id': class_to_idx[gt['class']]
-                }
-                gts.append(scaled_gt)
-            
-            # Collect predictions of this class
-            preds.extend([b for b in result['boxes'] if b[5] == class_id])
+    """Compute mAP per class from detection results with proper scaling and class alignment.
+    Computes AP at the requested IoU and also reports AP at IoU=0.3 as a fallback diagnostic.
+    """
+    def compute_ap_for_threshold(results, class_names, thresh):
+        aps_local = {}
+        class_to_idx = {name: idx for idx, name in enumerate(class_names)}
 
-        # Debug logging
-        print(f"[DEBUG] Class {class_name}: GT={len(gts)} | Pred={len(preds)}")
-        
-        if len(gts) == 0:
-            continue
-        
-        # Sort predictions by confidence
-        preds = sorted(preds, key=lambda x: x[4], reverse=True)
-        
-        tp = np.zeros(len(preds))
-        fp = np.zeros(len(preds))
-        matched = []
-        
-        for i, pred in enumerate(preds):
-            best_iou = 0
-            best_gt = None
-            for gt in gts:
-                iou = compute_iou(pred, (gt['x1'], gt['y1'], gt['x2'], gt['y2'], 1.0, gt['class_id']))
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt = gt
-            if best_iou >= iou_threshold and best_gt not in matched:
-                tp[i] = 1
-                matched.append(best_gt)
-            else:
-                fp[i] = 1
-        
-        # Precision-recall curve
-        tp_cum = np.cumsum(tp)
-        fp_cum = np.cumsum(fp)
-        recalls = tp_cum / len(gts)
-        precisions = tp_cum / (tp_cum + fp_cum + 1e-7)
-        
-        # AP = area under precision-recall curve
-        ap = np.trapz(precisions, recalls)
-        aps[class_name] = ap
-    
-    # Mean AP
-    map_score = np.mean(list(aps.values())) if aps else 0.0
-    print("\nPer-class AP:")
-    for cls, ap in aps.items():
+        for class_id, class_name in enumerate(class_names):
+            preds = []
+            gts = []
+
+            for result in results:
+                orig_w = result.get('orig_w')
+                orig_h = result.get('orig_h')
+                if orig_w is None or orig_h is None:
+                    orig_h, orig_w = result['image'].shape[:2]
+
+                # Scale GT boxes to resized image space
+                for gt in result['gt_boxes']:
+                    if gt['class'] != class_name:
+                        continue
+                    scaled_gt = {
+                        'x1': int(gt['x1'] * img_width / orig_w),
+                        'y1': int(gt['y1'] * img_height / orig_h),
+                        'x2': int(gt['x2'] * img_width / orig_w),
+                        'y2': int(gt['y2'] * img_height / orig_h),
+                        'class_id': class_to_idx.get(gt['class'], -1)
+                    }
+                    gts.append(scaled_gt)
+
+                # Collect predictions of this class
+                preds.extend([b for b in result['boxes'] if b[5] == class_id])
+
+            # Debug logging
+            print(f"[DEBUG] Class {class_name}: GT={len(gts)} | Pred={len(preds)} (IoU thresh={thresh})")
+            if len(gts) > 0:
+                print(f"  Sample GTs (up to 5): {gts[:5]}")
+            if len(preds) > 0:
+                print(f"  Sample Preds (up to 5): {preds[:5]}")
+
+            if len(gts) == 0:
+                continue
+
+            preds = sorted(preds, key=lambda x: x[4], reverse=True)
+
+            tp = np.zeros(len(preds))
+            fp = np.zeros(len(preds))
+            matched = []
+
+            for i, pred in enumerate(preds):
+                best_iou = 0
+                best_gt = None
+                for gt in gts:
+                    iou = compute_iou(pred, (gt['x1'], gt['y1'], gt['x2'], gt['y2'], 1.0, gt['class_id']))
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_gt = gt
+                if best_iou >= thresh and best_gt not in matched:
+                    tp[i] = 1
+                    matched.append(best_gt)
+                else:
+                    fp[i] = 1
+
+            tp_cum = np.cumsum(tp)
+            fp_cum = np.cumsum(fp)
+            recalls = tp_cum / len(gts)
+            precisions = tp_cum / (tp_cum + fp_cum + 1e-7)
+
+            ap = np.trapz(precisions, recalls)
+            aps_local[class_name] = ap
+
+        map_local = np.mean(list(aps_local.values())) if aps_local else 0.0
+        return aps_local, map_local
+
+    # Primary threshold
+    aps_primary, map_primary = compute_ap_for_threshold(results, class_names, iou_threshold)
+
+    # Secondary diagnostic thresholds (lower) to detect small-object matching issues
+    aps_lo, map_lo = ({}, 0.0)
+    aps_lo2, map_lo2 = ({}, 0.0)
+    if iou_threshold != 0.3:
+        aps_lo, map_lo = compute_ap_for_threshold(results, class_names, 0.3)
+    if iou_threshold not in (0.3, 0.1):
+        aps_lo2, map_lo2 = compute_ap_for_threshold(results, class_names, 0.1)
+
+    print("\nPer-class AP (primary):")
+    for cls, ap in aps_primary.items():
         print(f"  {cls}: {ap:.3f}")
-    print(f"\nMean Average Precision (mAP): {map_score:.3f}")
-    
-    return aps, map_score
+    print(f"\nMean Average Precision (mAP) @ {iou_threshold}: {map_primary:.3f}")
+
+    if aps_lo:
+        print(f"\nPer-class AP (IoU=0.3):")
+        for cls, ap in aps_lo.items():
+            print(f"  {cls}: {ap:.3f}")
+        print(f"\nMean Average Precision (mAP) @ 0.3: {map_lo:.3f}")
+
+    if aps_lo2:
+        print(f"\nPer-class AP (IoU=0.1):")
+        for cls, ap in aps_lo2.items():
+            print(f"  {cls}: {ap:.3f}")
+        print(f"\nMean Average Precision (mAP) @ 0.1: {map_lo2:.3f}")
+
+    return aps_primary, map_primary
 
 def test_tflite_model(tflite_path, test_data, class_names, num_samples=30):
     """Test TFLite detection model (handles both float32 and int8 quantized models)"""
@@ -943,31 +1031,44 @@ def visualize_detections(results, num_display=6):
         ax = axes[idx]
         ax.imshow(result['image'])
         
-        # Draw ground truth (green)
-        orig_h, orig_w = result['image'].shape[:2]
-        scale_x = IMG_WIDTH / orig_w
-        scale_y = IMG_HEIGHT / orig_h
+        # Get ORIGINAL dimensions (before resize)
+        orig_w = result.get('orig_w')
+        orig_h = result.get('orig_h')
         
+        if orig_w is None or orig_h is None:
+            # Fallback: assume standard LISA dimensions
+            orig_w, orig_h = 1280, 960
+        
+        # Scale factors: original -> resized
+        scale_x = IMG_WIDTH / orig_w   # e.g., 640/1280 = 0.5
+        scale_y = IMG_HEIGHT / orig_h  # e.g., 480/960 = 0.5
+        
+        # Draw ground truth (green) - boxes are in ORIGINAL coordinates
         for box in result['gt_boxes']:
-            x1, y1 = box['x1'], box['y1']
-            x2, y2 = box['x2'], box['y2']
-            # Scale to displayed image size using actual dimensions
-            x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
-            y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
+            x1 = int(box['x1'] * scale_x)
+            y1 = int(box['y1'] * scale_y)
+            x2 = int(box['x2'] * scale_x)
+            y2 = int(box['y2'] * scale_y)
+            
             # Clip to image bounds
-            x1, x2 = max(0, min(IMG_WIDTH, x1)), max(0, min(IMG_WIDTH, x2))
-            y1, y2 = max(0, min(IMG_HEIGHT, y1)), max(0, min(IMG_HEIGHT, y2))
+            x1 = max(0, min(IMG_WIDTH, x1))
+            y1 = max(0, min(IMG_HEIGHT, y1))
+            x2 = max(0, min(IMG_WIDTH, x2))
+            y2 = max(0, min(IMG_HEIGHT, y2))
+            
             w, h = x2 - x1, y2 - y1
             rect = patches.Rectangle((x1, y1), w, h, linewidth=2,
                                      edgecolor='green', facecolor='none', label='GT')
             ax.add_patch(rect)
         
-        # Draw predictions (red)
+        # Draw predictions (red) - already in resized coordinates
         for box in result['boxes']:
             x1, y1, x2, y2, conf, class_id = box
-            # Clip predictions too
-            x1, x2 = max(0, min(IMG_WIDTH, x1)), max(0, min(IMG_WIDTH, x2))
-            y1, y2 = max(0, min(IMG_HEIGHT, y1)), max(0, min(IMG_HEIGHT, y2))
+            x1 = max(0, min(IMG_WIDTH, x1))
+            y1 = max(0, min(IMG_HEIGHT, y1))
+            x2 = max(0, min(IMG_WIDTH, x2))
+            y2 = max(0, min(IMG_HEIGHT, y2))
+            
             w, h = x2 - x1, y2 - y1
             rect = patches.Rectangle((x1, y1), w, h, linewidth=2,
                                      edgecolor='red', facecolor='none')
@@ -983,7 +1084,7 @@ def visualize_detections(results, num_display=6):
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     plt.savefig(f'detection_results-{timestamp}.png', dpi=150, bbox_inches='tight')
-    print("Visualization saved: detection_results.png")
+    print(f"Visualization saved: detection_results-{timestamp}.png")
     plt.close()
 
 
@@ -1011,13 +1112,16 @@ def main():
     # Create dataset metadata (not loading images yet)
     print("\n[2/6] Validating dataset...")
     train_items = loader.create_dataset(train_data, apply_calibration=True)
-    test_items = loader.create_dataset(test_data, apply_calibration=True)
+    test_items = loader.create_dataset(test_data, apply_calibration=False)
     
     # Split training into train/val
-    from sklearn.model_selection import train_test_split
     train_items, val_items = train_test_split(
         train_items, test_size=0.2, random_state=42
     )
+
+    # Disable color calibration for validation to avoid stochastic noise mismatch
+    for item in val_items:
+        item['apply_calibration'] = False
     
     print(f"\nDataset sizes:")
     print(f"  Train: {len(train_items)}")
@@ -1038,7 +1142,7 @@ def main():
     test_item = random.choice(test_items)
     img = loader.preprocess_image(test_item['img_path'], True)
     preds = model.predict(np.expand_dims(img/255.0, axis=0))[0]
-    boxes = decode_predictions(preds, conf_threshold=0.3)
+    boxes = decode_predictions(preds, conf_threshold=CONF_THRESHOLD)
     print(f"Keras model found {len(boxes)} boxes")
     
     # Convert to TFLite
