@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from datetime import datetime
 
 # Configuration
 IMG_HEIGHT = 480
@@ -29,9 +30,9 @@ CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
 BATCH_SIZE = 8
 EPOCHS = 15
-LEARNING_RATE = 0.0001 # reduced from 0.001
+LEARNING_RATE = 0.0005 # reduced from 0.001
 IOU_THRESHOLD = 0.3
-CONF_THRESHOLD = 0.5
+CONF_THRESHOLD = 0.3
 MAX_SAMPLES = 10000  # Limit total samples to prevent memory issues
 
 # Dataset paths
@@ -301,57 +302,6 @@ class LISADetectionDataLoader:
             img = apply_ov2640_color_calibration(img)
         
         return img
-
-    def augment_image(self, image, boxes=None, augment_boxes=True):
-        """
-        Aggressive data augmentation - makes training harder, prevents overfitting
-        
-        Args:
-            image: numpy array [H, W, 3] in range [0, 1]
-            boxes: optional list of boxes to augment along with image
-            augment_boxes: whether to transform boxes with image
-        """
-        # Convert to tensor if needed
-        if isinstance(image, np.ndarray):
-            image = tf.constant(image, dtype=tf.float32)
-        
-        # 1. Random brightness (simulate different lighting)
-        image = tf.image.random_brightness(image, max_delta=0.3)
-        
-        # 2. Random contrast (simulate different cameras/weather)
-        image = tf.image.random_contrast(image, lower=0.7, upper=1.3)
-        
-        # 3. Random saturation (color variation)
-        image = tf.image.random_saturation(image, lower=0.7, upper=1.3)
-        
-        # 4. Random hue (slight color shift)
-        image = tf.image.random_hue(image, max_delta=0.1)
-        
-        # 5. Gaussian blur (simulate focus issues) - 30% chance
-        if random.random() > 0.7:
-            # Simple blur using average pooling trick
-            kernel_size = random.choice([3, 5])
-            image = tf.nn.avg_pool2d(
-                tf.expand_dims(image, 0),
-                ksize=kernel_size,
-                strides=1,
-                padding='SAME'
-            )[0]
-        
-        # 6. Random noise (simulate sensor noise)
-        if random.random() > 0.5:
-            noise = tf.random.normal(shape=tf.shape(image), mean=0.0, stddev=0.03)
-            image = image + noise
-        
-        # 7. Random horizontal flip - 50% chance
-        # Note: This requires flipping boxes too if augment_boxes=True
-        if random.random() > 0.5 and not augment_boxes:
-            image = tf.image.flip_left_right(image)
-        
-        # Clip to valid range
-        image = tf.clip_by_value(image, 0, 1)
-        
-        return image
     
     def create_dataset(self, data, apply_calibration=True):
         """Create dataset metadata (paths only, not loaded into memory)"""
@@ -390,8 +340,8 @@ class LISADetectionDataLoader:
         print(f"Valid samples: {len(valid_data)}")
         return valid_data
     
-    def data_generator(self, data, batch_size, shuffle=True, augment=False):
-        """Generator with augmentation support"""
+    def data_generator(self, data, batch_size, shuffle=True):
+        """Generator that yields batches of (images, targets)"""
         indices = np.arange(len(data))
         
         while True:
@@ -407,25 +357,20 @@ class LISADetectionDataLoader:
                 for idx in batch_indices:
                     item = data[idx]
                     
+                    # Load and preprocess image
                     img = self.preprocess_image(item['img_path'], item['apply_calibration'])
                     if img is None:
                         continue
                     
-                    # Normalize
-                    img = img / 255.0
-                    
-                    # Apply augmentation to training data
-                    if augment:
-                        img = self.augment_image(img, augment_boxes=False)
-                    
+                    # Encode ground truth
                     target = self.encode_ground_truth(item['boxes'], item['orig_w'], item['orig_h'])
                     
-                    batch_images.append(img)
+                    batch_images.append(img / 255.0)
                     batch_targets.append(target)
                 
                 if len(batch_images) > 0:
                     yield (np.array(batch_images, dtype=np.float32), 
-                        np.array(batch_targets, dtype=np.float32))
+                           np.array(batch_targets, dtype=np.float32))
 
 def classification_accuracy(y_true, y_pred):
     cls_true = y_true[..., 5:]
@@ -457,22 +402,19 @@ def create_detection_model(num_classes):
     
     # Fine-tune last layers
     backbone.trainable = True
-    # for layer in backbone.layers[:-20]:
-    for layer in backbone.layers[:-10]:
+    for layer in backbone.layers[:-20]:
         layer.trainable = False
     
     # Extract features
     x = backbone(inputs, training=False)
     
     # Detection head
-    x = layers.Conv2D(256, 3, padding='same', activation='relu',
-        kernel_regularizer=keras.regularizers.l2(0.01))(x)
+    x = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)  # testing
-    x = layers.Conv2D(128, 3, padding='same', activation='relu',
-        kernel_regularizer=keras.regularizers.l2(0.01))(x)
+    x = layers.Dropout(0.2)(x)  # testing
+    x = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)  # testing
+    x = layers.Dropout(0.2)(x)  # testing
     
     # Resize to grid
     x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
@@ -532,63 +474,13 @@ def detection_loss(y_true, y_pred):
     
     return total_loss
 
-def detection_loss_with_focal(y_true, y_pred, alpha=0.25, gamma=2.0):
-    """
-    Detection loss with Focal Loss for objectness
-    Focal loss focuses on hard examples, preventing easy overfitting
-    """
-    # Split predictions
-    obj_true = y_true[..., 0:1]
-    box_true = y_true[..., 1:5]
-    cls_true = y_true[..., 5:]
-    
-    obj_pred = tf.sigmoid(y_pred[..., 0:1])
-    box_pred = y_pred[..., 1:5]
-    cls_pred = tf.sigmoid(y_pred[..., 5:])
-    
-    obj_mask = obj_true
-    noobj_mask = 1 - obj_true
-    
-    epsilon = 1e-7
-    
-    # FOCAL LOSS for objectness (focus on hard examples)
-    obj_pred_clipped = tf.clip_by_value(obj_pred, epsilon, 1 - epsilon)
-    
-    # Focal loss weights hard examples more
-    pt = tf.where(obj_true > 0.5, obj_pred_clipped, 1 - obj_pred_clipped)
-    focal_weight = tf.pow(1 - pt, gamma)
-    
-    obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + 
-                (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
-    
-    obj_loss = focal_weight * obj_mask * obj_bce
-    noobj_loss = focal_weight * noobj_mask * obj_bce
-    objectness_loss = tf.reduce_mean(obj_loss + 0.5 * noobj_loss)
-    
-    # Box regression loss with L1 (more robust than L2)
-    box_diff = tf.abs(box_true - box_pred)
-    box_loss = obj_mask * tf.reduce_sum(box_diff, axis=-1, keepdims=True)
-    box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
-    
-    # Classification loss
-    cls_pred_clipped = tf.clip_by_value(cls_pred, epsilon, 1 - epsilon)
-    cls_bce = -(cls_true * tf.math.log(cls_pred_clipped) + 
-                (1 - cls_true) * tf.math.log(1 - cls_pred_clipped))
-    cls_loss = obj_mask * tf.reduce_mean(cls_bce, axis=-1, keepdims=True)
-    cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
-    
-    # Weighted sum - INCREASE box loss weight
-    total_loss = 10.0 * box_loss + objectness_loss + 0.5 * cls_loss
-    
-    return total_loss
 
 def train_model(model, train_data, val_data, train_loader, val_loader):
     """Train detection model using data generators"""
     
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE, weight_decay=1e-4),
-        #loss=detection_loss,
-        loss=detection_loss_with_focal,
+        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE, weight_decay=1e-5),
+        loss=detection_loss,
         metrics=[classification_accuracy]
     )
     
@@ -598,25 +490,19 @@ def train_model(model, train_data, val_data, train_loader, val_loader):
     
     callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor='val_mAP',
+            monitor='val_loss',
             patience=5,
-            mode='max',
-            restore_best_weights=True,
-            min_delta=0.01,
-            verbose=1
+            restore_best_weights=True
         ),
         keras.callbacks.ReduceLROnPlateau(
-            monitor='val_mAP',
+            monitor='val_loss',
             factor=0.5,
             patience=3,
-            mode='max',
-            min_lr=1e-7,
-            verbose=1
+            min_lr=1e-7
         ),
         keras.callbacks.ModelCheckpoint(
             'best_detection_model.h5',
-            monitor='val_mAP',
-            mode='max',
+            monitor='val_loss',
             save_best_only=True,
             verbose=1
         ),
@@ -625,14 +511,8 @@ def train_model(model, train_data, val_data, train_loader, val_loader):
     ]
     
     # Create generators
-    # train_gen = train_loader.data_generator(train_data, BATCH_SIZE, shuffle=True)
-    # val_gen = val_loader.data_generator(val_data, BATCH_SIZE, shuffle=False)
-    train_gen = train_loader.data_generator(
-        train_data, BATCH_SIZE, shuffle=True, augment=True
-    )
-    val_gen = val_loader.data_generator(
-        val_data, BATCH_SIZE, shuffle=False, augment=False
-    )
+    train_gen = train_loader.data_generator(train_data, BATCH_SIZE, shuffle=True)
+    val_gen = val_loader.data_generator(val_data, BATCH_SIZE, shuffle=False)
     
     history = model.fit(
         train_gen,
@@ -1086,7 +966,7 @@ def visualize_detections(results, num_display=6):
         ax.axis('off')
     
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig('detection_results.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'detection_results-{datetime.fromtimestamp(datetime.now().timestamp())}.png', dpi=150, bbox_inches='tight')
     print("Visualization saved: detection_results.png")
     plt.close()
 
