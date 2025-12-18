@@ -31,8 +31,8 @@ NUM_ANCHORS = 4
 BATCH_SIZE = 8
 EPOCHS = 15
 LEARNING_RATE = 0.0001 # reduced from 0.001
-IOU_THRESHOLD = 0.75
-CONF_THRESHOLD = 0.75
+IOU_THRESHOLD = 0.5
+CONF_THRESHOLD = 0.3
 MAX_SAMPLES = 20000  # Limit total samples to prevent memory issues
 
 # Dataset paths
@@ -40,18 +40,15 @@ DATASET_ROOT = "LISA Traffic Light Dataset"
 ANNOTATIONS_ROOT = os.path.join(DATASET_ROOT, "Annotations", "Annotations")
 
 # Anchor boxes (width, height) normalized to cell size
-# ANCHORS = np.array([
-#     [0.2, 0.6],   # New smaller anchor for tiny/distant lights
-#     [0.3, 0.8],   # Tall thin traffic light
-#     [0.5, 1.2],   # Medium traffic light
-#     [0.7, 1.5]    # Large traffic light
-# ])
-ANCHORS = np.array([
-    [0.1, 0.3],
-    [0.15, 0.4],
-    [0.25, 0.6],
-    [0.35, 0.75]
+ANCHOR_BOXES_PIXELS = np.array([
+    [8, 24],    # Very small: 8×24 pixels (distant lights)
+    [12, 32],   # Small: 12×32 pixels
+    [20, 50],   # Medium: 20×50 pixels  
+    [30, 70]    # Large: 30×70 pixels
 ])
+
+# Convert to image fractions for network
+ANCHORS = ANCHOR_BOXES_PIXELS / np.array([IMG_WIDTH, IMG_HEIGHT])
 
 def apply_ov2640_color_calibration(image, add_noise=True):
     """Apply color calibration to match OV2640 camera characteristics.
@@ -259,7 +256,21 @@ class LISADetectionDataLoader:
                             'boxes': boxes,
                             'split': 'test'
                         })
-        
+        # Add this to find optimal anchor sizes
+        sizes = []
+        for item in all_data:
+            for box in item['boxes']:
+                w = box['x2'] - box['x1']
+                h = box['y2'] - box['y1']
+                sizes.append((w, h))
+                
+        # Use K-means clustering to find optimal anchors
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=4).fit(sizes)
+        optimal_anchors = kmeans.cluster_centers_
+        for anchor in optimal_anchors:
+            print(anchor)
+
         return all_data
     
     def encode_ground_truth(self, boxes, img_width, img_height):
@@ -269,15 +280,13 @@ class LISADetectionDataLoader:
         target = np.zeros((GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + self.num_classes))
         
         for box in boxes:
-            if box['class'] not in self.class_to_idx:
+            if box['class'] not in self.class_to_idx:  # Add this check
                 continue
-            
-            # Normalize coordinates
-            x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
-            x_center = ((x1 + x2) / 2) / img_width
-            y_center = ((y1 + y2) / 2) / img_height
-            box_w = (x2 - x1) / img_width
-            box_h = (y2 - y1) / img_height
+            # Normalize to [0,1] relative to full image
+            x_center = ((box['x1'] + box['x2']) / 2) / img_width
+            y_center = ((box['y1'] + box['y2']) / 2) / img_height
+            box_w = (box['x2'] - box['x1']) / img_width
+            box_h = (box['y2'] - box['y1']) / img_height
             
             # Find grid cell
             grid_x = int(x_center * GRID_SIZE)
@@ -285,32 +294,36 @@ class LISADetectionDataLoader:
             grid_x = min(grid_x, GRID_SIZE - 1)
             grid_y = min(grid_y, GRID_SIZE - 1)
             
-            # Find best anchor
+            # Find best anchor by IoU
             best_anchor = 0
             best_iou = 0
             for anchor_idx, anchor in enumerate(ANCHORS):
-                anchor_w = anchor[0] / GRID_SIZE
-                anchor_h = anchor[1] / GRID_SIZE
+                anchor_w = anchor[0]  # Already in image fraction
+                anchor_h = anchor[1]  # Already in image fraction
+                
                 intersection = min(box_w, anchor_w) * min(box_h, anchor_h)
                 union = box_w * box_h + anchor_w * anchor_h - intersection
                 iou = intersection / union if union > 0 else 0
+                
                 if iou > best_iou:
                     best_iou = iou
                     best_anchor = anchor_idx
             
-            # Cell-relative coordinates
+            # Cell-relative position [0,1]
             cell_x = x_center * GRID_SIZE - grid_x
             cell_y = y_center * GRID_SIZE - grid_y
             
-            # YOLO-style: encode as log(box_size / anchor_size)
-            anchor_w = ANCHORS[best_anchor][0] / GRID_SIZE
-            anchor_h = ANCHORS[best_anchor][1] / GRID_SIZE
-            tw = np.log(box_w / anchor_w + 1e-16)
-            th = np.log(box_h / anchor_h + 1e-16)
+            # Encode box size relative to anchor
+            anchor_w = ANCHORS[best_anchor][0]
+            anchor_h = ANCHORS[best_anchor][1]
             
-            # Encode target
+            # YOLO-style: log of ratio
+            tw = np.log(box_w / (anchor_w + 1e-16))
+            th = np.log(box_h / (anchor_h + 1e-16))
+            
+            # Store in target
             class_idx = self.class_to_idx[box['class']]
-            target[grid_y, grid_x, best_anchor, 0] = 1.0
+            target[grid_y, grid_x, best_anchor, 0] = 1.0  # objectness
             target[grid_y, grid_x, best_anchor, 1] = cell_x
             target[grid_y, grid_x, best_anchor, 2] = cell_y
             target[grid_y, grid_x, best_anchor, 3] = tw
@@ -474,9 +487,6 @@ def create_detection_model(num_classes):
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.5)(x)
 
-    # Resize to grid
-    x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
-
     # Final prediction: [GRID_SIZE, GRID_SIZE, NUM_ANCHORS * (5 + NUM_CLASSES)]
     x = layers.Conv2D(NUM_ANCHORS * (5 + num_classes), 1, padding='same',
                     kernel_regularizer=reg)(x)
@@ -538,7 +548,10 @@ def detection_loss(y_true, y_pred):
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
 
     # Total loss
-    total_loss = 5.0 * box_loss + objectness_loss + 0.2 * cls_loss
+    total_loss = 3.0 * box_loss + objectness_loss + 0.2 * cls_loss
+
+    # tf.print(" Box Loss:", box_loss, "Objectness:", objectness_loss,
+    #          "Cls:", cls_loss, "Total:", total_loss, summarize=10)
 
     return total_loss
 
@@ -607,48 +620,52 @@ def decode_predictions(predictions, conf_threshold=CONF_THRESHOLD):
     for i in range(GRID_SIZE):
         for j in range(GRID_SIZE):
             for a in range(NUM_ANCHORS):
-                # Objectness
-                raw_obj = predictions[i, j, a, 0]
-                obj_conf = 1 / (1 + np.exp(-np.clip(raw_obj, -10, 10)))
+                # Objectness confidence
+                obj_logit = np.clip(predictions[i, j, a, 0], -10, 10)
+                obj_conf = 1 / (1 + np.exp(-obj_logit))
+                
                 if obj_conf < conf_threshold:
                     continue
                 
-                # Cell offsets
-                tx = predictions[i, j, a, 1]
-                ty = predictions[i, j, a, 2]
-                cell_x = 1 / (1 + np.exp(-np.clip(tx, -10, 10)))
-                cell_y = 1 / (1 + np.exp(-np.clip(ty, -10, 10)))
+                # Cell-relative offsets [0,1]
+                tx = np.clip(predictions[i, j, a, 1], -10, 10)
+                ty = np.clip(predictions[i, j, a, 2], -10, 10)
+                cell_x = 1 / (1 + np.exp(-tx))
+                cell_y = 1 / (1 + np.exp(-ty))
                 
-                # Width/height with anchors
+                # Box size relative to anchor
                 tw = np.clip(predictions[i, j, a, 3], -10, 10)
                 th = np.clip(predictions[i, j, a, 4], -10, 10)
                 
-                anchor_w = ANCHORS[a][0] / GRID_SIZE
-                anchor_h = ANCHORS[a][1] / GRID_SIZE
+                # CRITICAL FIX: Use anchors as image fractions directly
+                anchor_w = ANCHORS[a][0]  # Already image fraction
+                anchor_h = ANCHORS[a][1]  # Already image fraction
                 
-                box_w = anchor_w * np.exp(tw)
-                box_h = anchor_h * np.exp(th)
+                box_w = anchor_w * np.exp(tw)  # Image fraction
+                box_h = anchor_h * np.exp(th)  # Image fraction
                 
-                # Convert to image coords
-                x_center = (j + cell_x) / GRID_SIZE
-                y_center = (i + cell_y) / GRID_SIZE
+                # Convert to image coordinates
+                x_center = (j + cell_x) / GRID_SIZE  # Image fraction [0,1]
+                y_center = (i + cell_y) / GRID_SIZE  # Image fraction [0,1]
                 
+                # Convert to pixel coordinates
                 x1 = int((x_center - box_w / 2) * IMG_WIDTH)
                 y1 = int((y_center - box_h / 2) * IMG_HEIGHT)
                 x2 = int((x_center + box_w / 2) * IMG_WIDTH)
                 y2 = int((y_center + box_h / 2) * IMG_HEIGHT)
                 
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                
+                # Clip to image bounds
                 x1 = max(0, min(IMG_WIDTH, x1))
                 y1 = max(0, min(IMG_HEIGHT, y1))
                 x2 = max(0, min(IMG_WIDTH, x2))
                 y2 = max(0, min(IMG_HEIGHT, y2))
                 
-                # Classes
-                class_logits = predictions[i, j, a, 5:]
-                class_probs = 1 / (1 + np.exp(-np.clip(class_logits, -10, 10)))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Class prediction
+                class_logits = np.clip(predictions[i, j, a, 5:], -10, 10)
+                class_probs = 1 / (1 + np.exp(-class_logits))
                 class_id = np.argmax(class_probs)
                 class_conf = class_probs[class_id]
                 
@@ -793,11 +810,11 @@ def evaluate_map(results, class_names, iou_threshold=0.5, img_width=IMG_WIDTH, i
                 preds.extend([b for b in result['boxes'] if b[5] == class_id])
 
             # Debug logging
-            print(f"[DEBUG] Class {class_name}: GT={len(gts)} | Pred={len(preds)} (IoU thresh={thresh})")
-            if len(gts) > 0:
-                print(f"  Sample GTs (up to 5): {gts[:5]}")
-            if len(preds) > 0:
-                print(f"  Sample Preds (up to 5): {preds[:5]}")
+            # print(f"[DEBUG] Class {class_name}: GT={len(gts)} | Pred={len(preds)} (IoU thresh={thresh})")
+            # if len(gts) > 0:
+            #     print(f"  Sample GTs (up to 5): {gts[:5]}")
+            # if len(preds) > 0:
+            #     print(f"  Sample Preds (up to 5): {preds[:5]}")
 
             if len(gts) == 0:
                 continue
