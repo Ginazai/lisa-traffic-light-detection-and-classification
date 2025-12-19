@@ -22,8 +22,8 @@ import matplotlib.patches as patches
 from datetime import datetime
 
 # Configuration
-IMG_HEIGHT = 480
-IMG_WIDTH = 640
+IMG_HEIGHT = 600
+IMG_WIDTH = 800
 GRID_SIZE = 8  # Divide image into 16x16 grid
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
@@ -31,9 +31,10 @@ NUM_ANCHORS = 4
 BATCH_SIZE = 8
 EPOCHS = 15
 LEARNING_RATE = 0.0005
-IOU_THRESHOLD = 0.5 # 0.6 reduced for testing
+IOU_THRESHOLD_EVAL = 0.25  # En vez de 0.3
+IOU_THRESHOLD_NMS = 0.2    # Para NMS más agresivo
 CONF_THRESHOLD = 0.75 # 0.75 reduced for testing
-MAX_SAMPLES = 20000  # Limit total samples to prevent memory issues
+MAX_SAMPLES = 12000  # Limit total samples to prevent memory issues
 
 # Dataset paths
 DATASET_ROOT = "LISA Traffic Light Dataset"
@@ -101,7 +102,7 @@ class DetectionPreview(keras.callbacks.Callback):
         print(f"Epoch {epoch+1}: detection preview saved")
 
 class MAPCallback(keras.callbacks.Callback):
-    def __init__(self, val_data, loader, class_names, iou_threshold=IOU_THRESHOLD, num_samples=200):
+    def __init__(self, val_data, loader, class_names, iou_threshold=IOU_THRESHOLD_EVAL , num_samples=200):
         super().__init__()
         self.val_data = val_data
         self.loader = loader
@@ -480,6 +481,37 @@ class LISADetectionDataLoader:
                     yield (np.array(batch_images, dtype=np.float32), 
                            np.array(batch_targets, dtype=np.float32))
 
+def classification_metrics(y_true, y_pred):
+    """Métricas más informativas"""
+    cls_true = y_true[..., 5:]
+    cls_pred = tf.sigmoid(y_pred[..., 5:])
+    obj_true = y_true[..., 0]
+    obj_pred = tf.sigmoid(y_pred[..., 0])
+    
+    # Accuracy solo en celdas positivas (tu métrica actual)
+    cls_true_idx = tf.argmax(cls_true, axis=-1)
+    cls_pred_idx = tf.argmax(cls_pred, axis=-1)
+    obj_mask = tf.cast(obj_true > 0.5, tf.float32)
+    
+    correct = tf.cast(tf.equal(cls_true_idx, cls_pred_idx), tf.float32) * obj_mask
+    pos_accuracy = tf.reduce_sum(correct) / (tf.reduce_sum(obj_mask) + 1e-7)
+    
+    # NUEVO: Accuracy en todas las predicciones confiadas
+    pred_mask = tf.cast(obj_pred > 0.5, tf.float32)  # Predicciones confiadas
+    has_gt = tf.cast(obj_true > 0.5, tf.float32)  # Tiene GT
+    
+    # TP: predicción confiada con GT correcto
+    tp = correct
+    # FP: predicción confiada sin GT o con clase incorrecta
+    fp = pred_mask * (1 - has_gt) + pred_mask * has_gt * (1 - tf.cast(tf.equal(cls_true_idx, cls_pred_idx), tf.float32))
+    
+    precision = tf.reduce_sum(tp) / (tf.reduce_sum(tp + fp) + 1e-7)
+    
+    return {
+        'cls_acc_positive': pos_accuracy,  # Tu métrica actual
+        'cls_precision': precision  # Nueva métrica más realista
+    }
+
 def classification_accuracy(y_true, y_pred):
     """Classification accuracy metric"""
     cls_true = y_true[..., 5:]
@@ -529,6 +561,15 @@ def create_detection_model(num_classes):
 def detection_loss(y_true, y_pred):
     """Custom detection loss function combining objectness, bbox, and classification losses"""
     epsilon = 1e-7
+
+    class_weights = tf.constant([
+        1.0,    # go (baseline)
+        16.9,   # goLeft (254/15)
+        1.14,   # stop (254/222)
+        2.47,   # stopLeft (254/103)
+        8.19,   # warning (254/31)
+        23.1    # warningLeft (254/11)
+    ], dtype=tf.float32)
     
     # Split predictions / ground truth
     obj_true = y_true[..., 0:1]
@@ -562,15 +603,19 @@ def detection_loss(y_true, y_pred):
     box_loss = obj_mask * tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
     box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
 
-    # Classification BCE
+    # Classification BCE WITH WEIGHTS
     cls_pred_clipped = tf.clip_by_value(cls_pred, epsilon, 1 - epsilon)
-    cls_bce = -(cls_true * tf.math.log(cls_pred_clipped) + (1 - cls_true) * tf.math.log(1 - cls_pred_clipped))
-    cls_loss = obj_mask * tf.reduce_mean(cls_bce, axis=-1, keepdims=True)
+    cls_bce = -(cls_true * tf.math.log(cls_pred_clipped) + 
+                (1 - cls_true) * tf.math.log(1 - cls_pred_clipped))
+    
+    # Apply per-class weights
+    weighted_cls_bce = cls_bce * tf.expand_dims(class_weights, axis=0)
+    cls_loss = obj_mask * tf.reduce_mean(weighted_cls_bce, axis=-1, keepdims=True)
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
-
-    # CAMBIO CLAVE: Rebalancea los pesos totales
-    total_loss = 1.5 * box_loss + 2.0 * objectness_loss + 0.5 * cls_loss
-
+    
+    # Aumenta peso de box loss por IoU bajo
+    total_loss = 3.0 * box_loss + 2.0 * objectness_loss + 2.5 * cls_loss
+    
     return total_loss
 
 
@@ -580,7 +625,7 @@ def train_model(model, train_data, val_data, train_loader, val_loader):
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE, weight_decay=1e-5),
         loss=detection_loss,
-        metrics=[classification_accuracy]
+        metrics=[lambda y_t, y_p: classification_metrics(y_t, y_p)['cls_precision']]
     )
     
     # Calculate steps per epoch
@@ -690,7 +735,7 @@ def decode_predictions(predictions, conf_threshold=CONF_THRESHOLD):
     
     return boxes
     
-def non_max_suppression(boxes, iou_threshold=IOU_THRESHOLD):
+def non_max_suppression(boxes, iou_threshold=IOU_THRESHOLD_NMS ):
     """Apply NMS to remove overlapping boxes"""
     if len(boxes) == 0:
         return []
@@ -767,79 +812,217 @@ def convert_to_tflite(model, train_data, loader, output_path='traffic_light_dete
     
     return output_path
 
-def evaluate_map(results, class_names, iou_threshold=IOU_THRESHOLD, img_width=IMG_WIDTH, img_height=IMG_HEIGHT):
-    """Compute mAP per class from detection results"""
-    def compute_ap_for_threshold(results, class_names, thresh):
-        aps_local = {}
-        class_to_idx = {name: idx for idx, name in enumerate(class_names)}
-
-        for class_id, class_name in enumerate(class_names):
-            preds = []
-            gts = []
-
-            for result in results:
-                orig_w = result.get('orig_w')
-                orig_h = result.get('orig_h')
-                if orig_w is None or orig_h is None:
-                    orig_h, orig_w = result['image'].shape[:2]
-
-                # Scale GT boxes to resized image space
-                for gt in result['gt_boxes']:
-                    if gt['class'] != class_name:
-                        continue
-                    scaled_gt = {
-                        'x1': int(gt['x1'] * img_width / orig_w),
-                        'y1': int(gt['y1'] * img_height / orig_h),
-                        'x2': int(gt['x2'] * img_width / orig_w),
-                        'y2': int(gt['y2'] * img_height / orig_h),
-                        'class_id': class_to_idx.get(gt['class'], -1)
-                    }
-                    gts.append(scaled_gt)
-
-                preds.extend([b for b in result['boxes'] if b[5] == class_id])
-
-            if len(gts) == 0:
+def evaluate_map(results, class_names, iou_threshold=IOU_THRESHOLD_EVAL , img_width=IMG_WIDTH, img_height=IMG_HEIGHT, verbose=True):
+    """
+    Compute mAP with DETAILED debugging to understand why mAP is low
+    """
+    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
+    
+    # Global stats
+    total_predictions = 0
+    total_gt = 0
+    total_matches = 0
+    
+    # Track failures
+    failure_reasons = {
+        'no_predictions': 0,
+        'wrong_class': 0,
+        'low_iou': 0,
+        'already_matched': 0,
+        'successful_match': 0
+    }
+    
+    # Per-class detailed tracking
+    class_stats = {cn: {'tp': 0, 'fp': 0, 'fn': 0, 'gt_count': 0, 'pred_count': 0} for cn in class_names}
+    
+    # IoU histogram for analysis
+    iou_values = []
+    
+    print("\n" + "="*80)
+    print(f"mAP EVALUATION DEBUG (IoU threshold = {iou_threshold})")
+    print("="*80)
+    
+    for result_idx, result in enumerate(results):
+        orig_w = result.get('orig_w')
+        orig_h = result.get('orig_h')
+        if orig_w is None or orig_h is None:
+            orig_h, orig_w = result.get('image', np.zeros((img_height, img_width))).shape[:2]
+        
+        # Scale GT boxes to model image space
+        scaled_gts = []
+        for gt in result['gt_boxes']:
+            class_name = gt['class']
+            if class_name not in class_to_idx:
                 continue
-
-            preds = sorted(preds, key=lambda x: x[4], reverse=True)
-
-            tp = np.zeros(len(preds))
-            fp = np.zeros(len(preds))
-            matched = []
-
-            for i, pred in enumerate(preds):
-                best_iou = 0
-                best_gt = None
-                for gt in gts:
-                    iou = compute_iou(pred, (gt['x1'], gt['y1'], gt['x2'], gt['y2'], 1.0, gt['class_id']))
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_gt = gt
-                if best_iou >= thresh and best_gt not in matched:
-                    tp[i] = 1
-                    matched.append(best_gt)
-                else:
-                    fp[i] = 1
-
-            tp_cum = np.cumsum(tp)
-            fp_cum = np.cumsum(fp)
-            recalls = tp_cum / len(gts)
-            precisions = tp_cum / (tp_cum + fp_cum + 1e-7)
-
-            ap = np.trapz(precisions, recalls)
-            aps_local[class_name] = ap
-
-        map_local = np.mean(list(aps_local.values())) if aps_local else 0.0
-        return aps_local, map_local
-
-    aps_primary, map_primary = compute_ap_for_threshold(results, class_names, iou_threshold)
-
-    print("\nPer-class AP:")
-    for cls, ap in aps_primary.items():
-        print(f"  {cls}: {ap:.3f}")
-    print(f"\nmAP @ IoU={iou_threshold}: {map_primary:.3f}")
-
-    return aps_primary, map_primary
+            
+            scaled_gt = {
+                'x1': int(gt['x1'] * img_width / orig_w),
+                'y1': int(gt['y1'] * img_height / orig_h),
+                'x2': int(gt['x2'] * img_width / orig_w),
+                'y2': int(gt['y2'] * img_height / orig_h),
+                'class': class_name,
+                'class_id': class_to_idx[class_name],
+                'matched': False
+            }
+            scaled_gts.append(scaled_gt)
+            class_stats[class_name]['gt_count'] += 1
+            total_gt += 1
+        
+        # Get predictions
+        pred_boxes = result['boxes']
+        total_predictions += len(pred_boxes)
+        
+        if verbose and result_idx < 5:  # Show first 5 images in detail
+            print(f"\n--- Image {result_idx + 1}: {result.get('filename', 'unknown')} ---")
+            print(f"GT boxes: {len(scaled_gts)}, Predictions: {len(pred_boxes)}")
+            print(f"Original size: {orig_w}x{orig_h}, Model size: {img_width}x{img_height}")
+        
+        if len(pred_boxes) == 0:
+            failure_reasons['no_predictions'] += len(scaled_gts)
+            for gt in scaled_gts:
+                class_stats[gt['class']]['fn'] += 1
+            if verbose and result_idx < 5:
+                print("  ⚠️ NO PREDICTIONS for this image")
+            continue
+        
+        # Process each prediction
+        for pred_idx, pred in enumerate(pred_boxes):
+            x1, y1, x2, y2, conf, pred_class_id = pred
+            pred_class_name = class_names[pred_class_id]
+            class_stats[pred_class_name]['pred_count'] += 1
+            
+            # Find best matching GT
+            best_iou = 0
+            best_gt = None
+            best_gt_idx = None
+            
+            for gt_idx, gt in enumerate(scaled_gts):
+                # Must match class
+                if gt['class_id'] != pred_class_id:
+                    continue
+                
+                # Compute IoU
+                gt_box = (gt['x1'], gt['y1'], gt['x2'], gt['y2'], 1.0, gt['class_id'])
+                iou = compute_iou(pred, gt_box)
+                iou_values.append(iou)
+                
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt = gt
+                    best_gt_idx = gt_idx
+            
+            # Check if this is a valid match
+            if best_gt is None:
+                # No GT of same class found
+                failure_reasons['wrong_class'] += 1
+                class_stats[pred_class_name]['fp'] += 1
+                if verbose and result_idx < 5 and pred_idx < 3:
+                    print(f"  Pred {pred_idx}: {pred_class_name} @ ({x1},{y1},{x2},{y2}) conf={conf:.3f}")
+                    print(f"    ❌ WRONG CLASS - no GT of class '{pred_class_name}' in image")
+                    
+            elif best_iou < iou_threshold:
+                # IoU too low
+                failure_reasons['low_iou'] += 1
+                class_stats[pred_class_name]['fp'] += 1
+                if verbose and result_idx < 5 and pred_idx < 3:
+                    gt_size = f"{best_gt['x2']-best_gt['x1']}x{best_gt['y2']-best_gt['y1']}"
+                    pred_size = f"{x2-x1}x{y2-y1}"
+                    print(f"  Pred {pred_idx}: {pred_class_name} @ ({x1},{y1},{x2},{y2}) conf={conf:.3f}")
+                    print(f"    ❌ LOW IoU = {best_iou:.3f} < {iou_threshold}")
+                    print(f"       GT: ({best_gt['x1']},{best_gt['y1']},{best_gt['x2']},{best_gt['y2']}) size={gt_size}")
+                    print(f"       Pred size={pred_size}")
+                    
+            elif best_gt['matched']:
+                # Already matched by another prediction
+                failure_reasons['already_matched'] += 1
+                class_stats[pred_class_name]['fp'] += 1
+                if verbose and result_idx < 5 and pred_idx < 3:
+                    print(f"  Pred {pred_idx}: {pred_class_name} @ ({x1},{y1},{x2},{y2}) conf={conf:.3f}")
+                    print(f"    ❌ GT ALREADY MATCHED by another prediction")
+                    
+            else:
+                # Valid match!
+                best_gt['matched'] = True
+                failure_reasons['successful_match'] += 1
+                class_stats[pred_class_name]['tp'] += 1
+                total_matches += 1
+                if verbose and result_idx < 5 and pred_idx < 3:
+                    print(f"  Pred {pred_idx}: {pred_class_name} @ ({x1},{y1},{x2},{y2}) conf={conf:.3f}")
+                    print(f"    ✅ MATCH! IoU = {best_iou:.3f}")
+        
+        # Count false negatives (unmatched GTs)
+        for gt in scaled_gts:
+            if not gt['matched']:
+                class_stats[gt['class']]['fn'] += 1
+                if verbose and result_idx < 5:
+                    gt_size = f"{gt['x2']-gt['x1']}x{gt['y2']-gt['y1']}"
+                    print(f"  GT: {gt['class']} @ ({gt['x1']},{gt['y1']},{gt['x2']},{gt['y2']}) size={gt_size}")
+                    print(f"    ❌ UNMATCHED (False Negative)")
+    
+    # Compute per-class AP
+    aps = {}
+    for class_name in class_names:
+        stats = class_stats[class_name]
+        if stats['gt_count'] == 0:
+            continue
+        
+        # Simple precision/recall
+        tp = stats['tp']
+        fp = stats['fp']
+        fn = stats['fn']
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        
+        # Approximate AP (would need sorted predictions for true AP)
+        ap = precision * recall if recall > 0 else 0
+        aps[class_name] = ap
+    
+    map_score = np.mean(list(aps.values())) if aps else 0.0
+    
+    # Print summary
+    print("\n" + "="*80)
+    print("SUMMARY")
+    print("="*80)
+    print(f"\nTotal GT boxes: {total_gt}")
+    print(f"Total Predictions: {total_predictions}")
+    print(f"Successful Matches: {total_matches} ({100*total_matches/total_gt if total_gt > 0 else 0:.1f}% recall)")
+    
+    print(f"\nFailure breakdown:")
+    for reason, count in failure_reasons.items():
+        if reason != 'successful_match':
+            pct = 100 * count / total_gt if total_gt > 0 else 0
+            print(f"  {reason}: {count} ({pct:.1f}%)")
+    
+    print(f"\nPer-class statistics:")
+    print(f"{'Class':<15} {'GT':<6} {'Pred':<6} {'TP':<6} {'FP':<6} {'FN':<6} {'Precision':<10} {'Recall':<10} {'AP':<10}")
+    print("-" * 85)
+    for class_name in class_names:
+        stats = class_stats[class_name]
+        if stats['gt_count'] == 0:
+            continue
+        
+        precision = stats['tp'] / (stats['tp'] + stats['fp']) if (stats['tp'] + stats['fp']) > 0 else 0
+        recall = stats['tp'] / stats['gt_count'] if stats['gt_count'] > 0 else 0
+        ap = aps.get(class_name, 0)
+        
+        print(f"{class_name:<15} {stats['gt_count']:<6} {stats['pred_count']:<6} {stats['tp']:<6} {stats['fp']:<6} {stats['fn']:<6} {precision:<10.3f} {recall:<10.3f} {ap:<10.3f}")
+    
+    # IoU distribution
+    if iou_values:
+        iou_array = np.array(iou_values)
+        print(f"\nIoU distribution (all pred-GT pairs of same class):")
+        print(f"  Mean: {iou_array.mean():.3f}")
+        print(f"  Median: {np.median(iou_array):.3f}")
+        print(f"  <0.3: {100*np.sum(iou_array < 0.3)/len(iou_array):.1f}%")
+        print(f"  0.3-0.5: {100*np.sum((iou_array >= 0.3) & (iou_array < 0.5))/len(iou_array):.1f}%")
+        print(f"  >=0.5: {100*np.sum(iou_array >= 0.5)/len(iou_array):.1f}%")
+    
+    print(f"\n{'='*80}")
+    print(f"FINAL mAP @ IoU={iou_threshold}: {map_score:.3f}")
+    print(f"{'='*80}\n")
+    
+    return aps, map_score
 
 def test_tflite_model(tflite_path, test_data, class_names, num_samples=30):
     """Test TFLite detection model"""
@@ -983,6 +1166,67 @@ def visualize_detections(results, num_display=6):
     print(f"Visualization saved: detection_results-{timestamp}.png")
     plt.close()
 
+def debug_predictions_detailed(model, test_data, loader, num_samples=3):
+    """Muestra TODAS las predicciones antes de filtrar por confianza"""
+    print("\n" + "="*80)
+    print("DEBUG: Predicciones antes de filtrado por confianza")
+    print("="*80)
+    
+    samples = random.sample(test_data, min(num_samples, len(test_data)))
+    
+    for item in samples:
+        img = loader.preprocess_image(item['img_path'], False)
+        if img is None:
+            continue
+        
+        preds = model.predict(np.expand_dims(img/255.0, axis=0), verbose=0)[0]
+        
+        print(f"\n{item['filename']}:")
+        print(f"  Ground truth: {len(item['boxes'])} objetos")
+        
+        # Recoger TODAS las predicciones (sin threshold)
+        all_boxes = decode_predictions(preds, conf_threshold=0.0)  # SIN FILTRO
+        
+        if len(all_boxes) == 0:
+            print("  ⚠️ NINGUNA predicción generada (incluso con threshold=0.0)")
+            continue
+        
+        # Ordenar por confianza
+        all_boxes_sorted = sorted(all_boxes, key=lambda x: x[4], reverse=True)
+        
+        print(f"  Total predicciones (threshold=0.0): {len(all_boxes_sorted)}")
+        print(f"\n  Top 10 predicciones más confiadas:")
+        print(f"  {'#':<3} {'x1':<5} {'y1':<5} {'x2':<5} {'y2':<5} {'Conf':<7} {'Class':<10} {'Size (px)'}")
+        print(f"  {'-'*70}")
+        
+        for i, box in enumerate(all_boxes_sorted[:10]):
+            x1, y1, x2, y2, conf, class_id = box
+            size = f"{x2-x1}x{y2-y1}"
+            class_name = loader.class_names[class_id]
+            print(f"  {i+1:<3} {x1:<5} {y1:<5} {x2:<5} {y2:<5} {conf:<7.4f} {class_name:<10} {size}")
+        
+        # Contar por rangos de confianza
+        conf_ranges = {
+            '>0.75': sum(1 for b in all_boxes_sorted if b[4] > 0.75),
+            '0.5-0.75': sum(1 for b in all_boxes_sorted if 0.5 <= b[4] <= 0.75),
+            '0.3-0.5': sum(1 for b in all_boxes_sorted if 0.3 <= b[4] < 0.5),
+            '0.1-0.3': sum(1 for b in all_boxes_sorted if 0.1 <= b[4] < 0.3),
+            '<0.1': sum(1 for b in all_boxes_sorted if b[4] < 0.1),
+        }
+        
+        print(f"\n  Distribución de confianzas:")
+        for range_name, count in conf_ranges.items():
+            print(f"    {range_name}: {count}")
+        
+        # Mostrar tamaños de GT
+        print(f"\n  Ground truth boxes (tamaños en imagen modelo):")
+        for gt in item['boxes']:
+            x1_scaled = int(gt['x1'] * IMG_WIDTH / item['orig_w'])
+            y1_scaled = int(gt['y1'] * IMG_HEIGHT / item['orig_h'])
+            x2_scaled = int(gt['x2'] * IMG_WIDTH / item['orig_w'])
+            y2_scaled = int(gt['y2'] * IMG_HEIGHT / item['orig_h'])
+            size = f"{x2_scaled-x1_scaled}x{y2_scaled-y1_scaled}"
+            print(f"    {gt['class']}: {size} píxeles")
 
 def main():
     """Main training pipeline"""
@@ -1040,7 +1284,8 @@ def main():
     # Test
     print("\n[6/6] Testing detection model...")
     results = test_tflite_model(tflite_path, test_items, loader.class_names, num_samples=30)
-    aps, map_score = evaluate_map(results, loader.class_names)
+    aps, map_score = evaluate_map(results, loader.class_names, verbose=True)
+    #debug_map_coordinates(results, num_samples=5)
 
     # Visualize
     visualize_detections(results)
