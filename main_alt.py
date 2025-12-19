@@ -29,10 +29,10 @@ CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
 BATCH_SIZE = 8
-EPOCHS = 18
+EPOCHS = 15
 LEARNING_RATE = 0.0005
-IOU_THRESHOLD = 0.6 # 0.6 reduced for testing
-CONF_THRESHOLD = 0.2 # 0.75 reduced for testing
+IOU_THRESHOLD = 0.5 # 0.6 reduced for testing
+CONF_THRESHOLD = 0.75 # 0.75 reduced for testing
 MAX_SAMPLES = 20000  # Limit total samples to prevent memory issues
 
 # Dataset paths
@@ -101,7 +101,7 @@ class DetectionPreview(keras.callbacks.Callback):
         print(f"Epoch {epoch+1}: detection preview saved")
 
 class MAPCallback(keras.callbacks.Callback):
-    def __init__(self, val_data, loader, class_names, iou_threshold=0.5, num_samples=200):
+    def __init__(self, val_data, loader, class_names, iou_threshold=IOU_THRESHOLD, num_samples=200):
         super().__init__()
         self.val_data = val_data
         self.loader = loader
@@ -551,11 +551,13 @@ def detection_loss(y_true, y_pred):
     # Objectness BCE
     obj_pred_clipped = tf.clip_by_value(obj_pred, epsilon, 1 - epsilon)
     obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
-    obj_loss = obj_mask * obj_bce
-    noobj_loss = noobj_mask * obj_bce
-    objectness_loss = tf.reduce_mean(obj_loss + 1.5 * noobj_loss)
+    
+    # CAMBIO CLAVE: Aumenta el peso de los positivos
+    obj_loss = obj_mask * obj_bce * 5.0  # Peso extra para objectness positivo
+    noobj_loss = noobj_mask * obj_bce * 0.5  # Reduce peso de negativos
+    objectness_loss = tf.reduce_mean(obj_loss + noobj_loss)
 
-    # Box regression
+    # Box regression (sin cambios)
     box_diff = box_true - box_pred
     box_loss = obj_mask * tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
     box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
@@ -566,8 +568,8 @@ def detection_loss(y_true, y_pred):
     cls_loss = obj_mask * tf.reduce_mean(cls_bce, axis=-1, keepdims=True)
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
 
-    # Total loss with weights
-    total_loss = 3.0 * box_loss + objectness_loss + 0.2 * cls_loss
+    # CAMBIO CLAVE: Rebalancea los pesos totales
+    total_loss = 1.5 * box_loss + 2.0 * objectness_loss + 0.5 * cls_loss
 
     return total_loss
 
@@ -765,7 +767,7 @@ def convert_to_tflite(model, train_data, loader, output_path='traffic_light_dete
     
     return output_path
 
-def evaluate_map(results, class_names, iou_threshold=0.5, img_width=IMG_WIDTH, img_height=IMG_HEIGHT):
+def evaluate_map(results, class_names, iou_threshold=IOU_THRESHOLD, img_width=IMG_WIDTH, img_height=IMG_HEIGHT):
     """Compute mAP per class from detection results"""
     def compute_ap_for_threshold(results, class_names, thresh):
         aps_local = {}
