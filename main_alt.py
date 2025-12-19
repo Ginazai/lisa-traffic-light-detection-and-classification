@@ -24,16 +24,27 @@ from datetime import datetime
 # Configuration
 IMG_HEIGHT = 480
 IMG_WIDTH = 640
+<<<<<<< HEAD
 GRID_SIZE = 8  # Divide image into 16x16 grid
+=======
+GRID_SIZE = 16  # Divide image into 16x16 grid
+>>>>>>> 280f3b410263185dc3d355d3fe3d6a46531bd9e0
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
 BATCH_SIZE = 8
 EPOCHS = 18
+<<<<<<< HEAD
 LEARNING_RATE = 0.0005
 IOU_THRESHOLD = 0.6 # 0.6 reduced for testing
 CONF_THRESHOLD = 0.2 # 0.75 reduced for testing
 MAX_SAMPLES = 20000  # Limit total samples to prevent memory issues
+=======
+LEARNING_RATE = 0.0001
+IOU_THRESHOLD = 0.6 # 0.6 reduced for testing
+CONF_THRESHOLD = 0.6 # 0.75 reduced for testing
+MAX_SAMPLES = 19000  # Limit total samples to prevent memory issues
+>>>>>>> 280f3b410263185dc3d355d3fe3d6a46531bd9e0
 
 # Dataset paths
 DATASET_ROOT = "LISA Traffic Light Dataset"
@@ -553,7 +564,11 @@ def detection_loss(y_true, y_pred):
     obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
     obj_loss = obj_mask * obj_bce
     noobj_loss = noobj_mask * obj_bce
+<<<<<<< HEAD
     objectness_loss = tf.reduce_mean(obj_loss + 1.5 * noobj_loss)
+=======
+    objectness_loss = tf.reduce_mean(obj_loss + 0.5 * noobj_loss)
+>>>>>>> 280f3b410263185dc3d355d3fe3d6a46531bd9e0
 
     # Box regression
     box_diff = box_true - box_pred
