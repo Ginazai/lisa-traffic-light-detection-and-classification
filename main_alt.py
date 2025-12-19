@@ -24,40 +24,26 @@ from datetime import datetime
 # Configuration
 IMG_HEIGHT = 480
 IMG_WIDTH = 640
-GRID_SIZE = 16  # Divide image into 8x8 grid
+GRID_SIZE = 8  # Divide image into 16x16 grid
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
 BATCH_SIZE = 8
-EPOCHS = 15
-LEARNING_RATE = 0.0001 # reduced from 0.001
-IOU_THRESHOLD = 0.75
-CONF_THRESHOLD = 0.75
+EPOCHS = 18
+LEARNING_RATE = 0.0005
+IOU_THRESHOLD = 0.6 # 0.6 reduced for testing
+CONF_THRESHOLD = 0.2 # 0.75 reduced for testing
 MAX_SAMPLES = 20000  # Limit total samples to prevent memory issues
 
 # Dataset paths
 DATASET_ROOT = "LISA Traffic Light Dataset"
 ANNOTATIONS_ROOT = os.path.join(DATASET_ROOT, "Annotations", "Annotations")
 
-# Anchor boxes (width, height) normalized to cell size
-# ANCHORS = np.array([
-#     [0.2, 0.6],   # New smaller anchor for tiny/distant lights
-#     [0.3, 0.8],   # Tall thin traffic light
-#     [0.5, 1.2],   # Medium traffic light
-#     [0.7, 1.5]    # Large traffic light
-# ])
-ANCHORS = np.array([
-    [0.1, 0.3],
-    [0.15, 0.4],
-    [0.25, 0.6],
-    [0.35, 0.75]
-])
+# Global anchor boxes (will be computed dynamically)
+ANCHORS = None
 
 def apply_ov2640_color_calibration(image, add_noise=True):
-    """Apply color calibration to match OV2640 camera characteristics.
-    If `add_noise` is False, no random sensor noise will be applied
-    (useful for deterministic validation / evaluation).
-    """
+    """Apply color calibration to match OV2640 camera characteristics."""
     image = image.astype(np.float32) / 255.0
 
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
@@ -99,7 +85,6 @@ class DetectionPreview(keras.callbacks.Callback):
             boxes = decode_predictions(preds)
             boxes = non_max_suppression(boxes)
 
-            # Build full result dict
             results.append({
                 'filename': item['filename'],
                 'ground_truth_count': len(item['boxes']),
@@ -125,7 +110,6 @@ class MAPCallback(keras.callbacks.Callback):
         self.num_samples = num_samples
 
     def on_epoch_end(self, epoch, logs=None):
-        # Sample a subset of validation data for speed
         sample_data = random.sample(self.val_data, min(self.num_samples, len(self.val_data)))
         
         results = []
@@ -146,7 +130,6 @@ class MAPCallback(keras.callbacks.Callback):
         
         aps, map_score = evaluate_map(results, self.class_names, iou_threshold=self.iou_threshold)
         
-        # Log into Keras history
         logs = logs or {}
         logs['val_mAP'] = map_score
         print(f"\nEpoch {epoch+1}: val_mAP={map_score:.3f}")
@@ -160,18 +143,17 @@ class LISADetectionDataLoader:
         self.class_names = ['go', 'goLeft', 'stop', 'stopLeft', 'warning', 'warningLeft']
         self.class_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
         self.num_classes = len(self.class_names)
+        self.anchors = None  # Will be computed dynamically
         
     def parse_annotations(self, csv_path):
         """Parse annotation CSV file"""
         df = pd.read_csv(csv_path, delimiter=';')
         
-        # Group by filename to handle multiple boxes per image
         grouped = {}
         for _, row in df.iterrows():
             filename = row['Filename']
             
-            # Fix filename path - remove any directory prefix
-            # Example: "dayTraining/dayClip13--00131.jpg" -> "dayClip13--00131.jpg"
+            # Fix filename path
             if '/' in filename:
                 filename = filename.split('/')[-1]
             if '\\' in filename:
@@ -180,17 +162,15 @@ class LISADetectionDataLoader:
             if filename not in grouped:
                 grouped[filename] = []
             
-            # Normalize class/annotation tag so it matches `self.class_names`
+            # Normalize class/annotation tag
             raw_tag = str(row['Annotation tag']).strip()
             matched_label = None
             for cname in self.class_names:
-                # compare case-insensitive and ignore spaces/hyphens
                 if raw_tag.lower().replace(' ', '').replace('-', '') == cname.lower().replace(' ', '').replace('-', ''):
                     matched_label = cname
                     break
 
             if matched_label is None:
-                # keep raw tag (it may be filtered later if unknown)
                 matched_label = raw_tag
 
             annotation = {
@@ -203,6 +183,74 @@ class LISADetectionDataLoader:
             grouped[filename].append(annotation)
         
         return grouped
+    
+    def compute_optimal_anchors(self, all_data):
+        """Compute optimal anchor boxes using K-means clustering"""
+        print("\n[Computing optimal anchors using K-means...]")
+        
+        # Collect all box sizes (normalized to image fractions)
+        box_sizes = []
+        for item in all_data:
+            # Get original image dimensions
+            img_path = os.path.join(item['img_dir'], item['filename'])
+            if not os.path.exists(img_path):
+                continue
+            
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
+            orig_h, orig_w = img.shape[:2]
+            
+            for box in item['boxes']:
+                # Skip unknown classes
+                if box['class'] not in self.class_to_idx:
+                    continue
+                
+                # Normalize to [0,1] image fractions
+                w = (box['x2'] - box['x1']) / orig_w
+                h = (box['y2'] - box['y1']) / orig_h
+                box_sizes.append([w, h])
+        
+        box_sizes = np.array(box_sizes)
+        print(f"Collected {len(box_sizes)} bounding boxes for anchor computation")
+        
+        if len(box_sizes) == 0:
+            print("WARNING: No valid boxes found! Using default anchors.")
+            self.anchors = np.array([
+                [0.05, 0.05],
+                [0.08, 0.08],
+                [0.12, 0.12],
+                [0.15, 0.15]
+            ])
+            return
+        
+        # Print statistics
+        print(f"Box size statistics (image fractions):")
+        print(f"  Width  - min: {box_sizes[:, 0].min():.4f}, max: {box_sizes[:, 0].max():.4f}, mean: {box_sizes[:, 0].mean():.4f}")
+        print(f"  Height - min: {box_sizes[:, 1].min():.4f}, max: {box_sizes[:, 1].max():.4f}, mean: {box_sizes[:, 1].mean():.4f}")
+        
+        # K-means clustering
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=NUM_ANCHORS, random_state=42, n_init=10)
+        kmeans.fit(box_sizes)
+        
+        # Sort anchors by area (small to large)
+        anchors = kmeans.cluster_centers_
+        areas = anchors[:, 0] * anchors[:, 1]
+        sorted_indices = np.argsort(areas)
+        self.anchors = anchors[sorted_indices]
+        
+        print(f"\nOptimal anchors (image fractions [width, height]):")
+        for i, anchor in enumerate(self.anchors):
+            area = anchor[0] * anchor[1]
+            print(f"  Anchor {i}: [{anchor[0]:.4f}, {anchor[1]:.4f}] - area: {area:.6f}")
+        
+        # Also print in pixel dimensions for reference
+        print(f"\nOptimal anchors (pixel dimensions @ {IMG_WIDTH}x{IMG_HEIGHT}):")
+        for i, anchor in enumerate(self.anchors):
+            w_px = anchor[0] * IMG_WIDTH
+            h_px = anchor[1] * IMG_HEIGHT
+            print(f"  Anchor {i}: [{w_px:.1f}px, {h_px:.1f}px]")
     
     def load_dataset(self):
         """Load all annotations from dataset"""
@@ -259,25 +307,29 @@ class LISADetectionDataLoader:
                             'boxes': boxes,
                             'split': 'test'
                         })
+
+        # Compute optimal anchors from all data
+        self.compute_optimal_anchors(all_data)
         
+        # Set global ANCHORS variable
+        global ANCHORS
+        ANCHORS = self.anchors
+
         return all_data
     
     def encode_ground_truth(self, boxes, img_width, img_height):
-        """
-        YOLO-style anchor-based encoding
-        """
+        """YOLO-style anchor-based encoding"""
         target = np.zeros((GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + self.num_classes))
         
         for box in boxes:
             if box['class'] not in self.class_to_idx:
                 continue
             
-            # Normalize coordinates
-            x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
-            x_center = ((x1 + x2) / 2) / img_width
-            y_center = ((y1 + y2) / 2) / img_height
-            box_w = (x2 - x1) / img_width
-            box_h = (y2 - y1) / img_height
+            # Normalize to [0,1] relative to full image
+            x_center = ((box['x1'] + box['x2']) / 2) / img_width
+            y_center = ((box['y1'] + box['y2']) / 2) / img_height
+            box_w = (box['x2'] - box['x1']) / img_width
+            box_h = (box['y2'] - box['y1']) / img_height
             
             # Find grid cell
             grid_x = int(x_center * GRID_SIZE)
@@ -285,32 +337,36 @@ class LISADetectionDataLoader:
             grid_x = min(grid_x, GRID_SIZE - 1)
             grid_y = min(grid_y, GRID_SIZE - 1)
             
-            # Find best anchor
+            # Find best anchor by IoU
             best_anchor = 0
             best_iou = 0
-            for anchor_idx, anchor in enumerate(ANCHORS):
-                anchor_w = anchor[0] / GRID_SIZE
-                anchor_h = anchor[1] / GRID_SIZE
+            for anchor_idx, anchor in enumerate(self.anchors):
+                anchor_w = anchor[0]
+                anchor_h = anchor[1]
+                
                 intersection = min(box_w, anchor_w) * min(box_h, anchor_h)
                 union = box_w * box_h + anchor_w * anchor_h - intersection
                 iou = intersection / union if union > 0 else 0
+                
                 if iou > best_iou:
                     best_iou = iou
                     best_anchor = anchor_idx
             
-            # Cell-relative coordinates
+            # Cell-relative position [0,1]
             cell_x = x_center * GRID_SIZE - grid_x
             cell_y = y_center * GRID_SIZE - grid_y
             
-            # YOLO-style: encode as log(box_size / anchor_size)
-            anchor_w = ANCHORS[best_anchor][0] / GRID_SIZE
-            anchor_h = ANCHORS[best_anchor][1] / GRID_SIZE
-            tw = np.log(box_w / anchor_w + 1e-16)
-            th = np.log(box_h / anchor_h + 1e-16)
+            # Encode box size relative to anchor
+            anchor_w = self.anchors[best_anchor][0]
+            anchor_h = self.anchors[best_anchor][1]
             
-            # Encode target
+            # YOLO-style: log of ratio
+            tw = np.log(box_w / (anchor_w + 1e-16))
+            th = np.log(box_h / (anchor_h + 1e-16))
+            
+            # Store in target
             class_idx = self.class_to_idx[box['class']]
-            target[grid_y, grid_x, best_anchor, 0] = 1.0
+            target[grid_y, grid_x, best_anchor, 0] = 1.0  # objectness
             target[grid_y, grid_x, best_anchor, 1] = cell_x
             target[grid_y, grid_x, best_anchor, 2] = cell_y
             target[grid_y, grid_x, best_anchor, 3] = tw
@@ -330,9 +386,8 @@ class LISADetectionDataLoader:
         img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
 
         if apply_calibration:
-            # Photometric augmentations only (do NOT change geometry unless boxes are transformed)
             img = apply_ov2640_color_calibration(img, add_noise=True)
-            # Augmentation
+            
             # Random brightness jitter
             if random.random() < 0.5:
                 factor = 1.0 + np.random.uniform(-0.2, 0.2)
@@ -361,20 +416,19 @@ class LISADetectionDataLoader:
         """Create dataset metadata (paths only, not loaded into memory)"""
         valid_data = []
         
-        print(f"Validating {MAX_SAMPLES} samples...")
+        print(f"Validating samples (max {MAX_SAMPLES})...")
         
         for idx, item in enumerate(data):
-            if idx % 500 == 0:
-                print(f"Validated {idx}/{MAX_SAMPLES} samples ({idx / MAX_SAMPLES * 100:.2f}%)")
+            if idx % 500 == 0 and idx > 0:
+                print(f"  Validated {idx} samples...")
             
             # Apply MAX_SAMPLES limit
             if len(valid_data) >= MAX_SAMPLES:
-                print(f"Reached MAX_SAMPLES limit ({MAX_SAMPLES}), stopping validation")
+                print(f"  Reached MAX_SAMPLES limit ({MAX_SAMPLES})")
                 break
             
             img_path = os.path.join(item['img_dir'], item['filename'])
             
-            # Just check if file exists
             if not os.path.exists(img_path):
                 continue
             
@@ -391,7 +445,7 @@ class LISADetectionDataLoader:
             item['apply_calibration'] = apply_calibration
             valid_data.append(item)
         
-        print(f"Valid samples: {len(valid_data)}")
+        print(f"  Valid samples: {len(valid_data)}")
         return valid_data
     
     def data_generator(self, data, batch_size, shuffle=True):
@@ -427,80 +481,55 @@ class LISADetectionDataLoader:
                            np.array(batch_targets, dtype=np.float32))
 
 def classification_accuracy(y_true, y_pred):
+    """Classification accuracy metric"""
     cls_true = y_true[..., 5:]
     cls_pred = tf.sigmoid(y_pred[..., 5:])
     cls_true_idx = tf.argmax(cls_true, axis=-1)
     cls_pred_idx = tf.argmax(cls_pred, axis=-1)
 
-    # Only count where an object exists
-    obj_mask = tf.cast(y_true[..., 0], tf.float32)  # shape [B, G, G, A]
+    obj_mask = tf.cast(y_true[..., 0], tf.float32)
     correct = tf.cast(tf.equal(cls_true_idx, cls_pred_idx), tf.float32) * tf.cast(obj_mask, tf.float32)
 
     return tf.reduce_sum(correct) / (tf.reduce_sum(tf.cast(obj_mask, tf.float32)) + 1e-7)
 
 def create_detection_model(num_classes):
-    """
-    Create lightweight detection model
-    Architecture: MobileNetV2 backbone + detection heads
-    """
-    # Input
+    """Create lightweight detection model with MobileNetV2 backbone"""
     inputs = keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
-    
-    # Backbone: MobileNetV2 (feature extractor)
     backbone = keras.applications.MobileNetV2(
         input_shape=(IMG_HEIGHT, IMG_WIDTH, 3),
         include_top=False,
         weights='imagenet',
-        alpha=0.5  # Reduced width for efficiency
+        alpha=0.5
     )
-    
-   # Fine-tune last layers
     backbone.trainable = True
-    for layer in backbone.layers[:-100]:
+    for layer in backbone.layers[:-20]:
         layer.trainable = False
 
-    # Extract features
     x = backbone(inputs, training=False)
 
-    # Detection head with stronger regularization
-    # reg = keras.regularizers.l2(1e-4)
     reg = keras.regularizers.l2(5e-4)
-    x = layers.Conv2D(256, 3, padding='same', activation='relu',
-                    kernel_regularizer=reg)(x)
+    x = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.5)(x)
-    x = layers.Conv2D(128, 3, padding='same', activation='relu',
-                    kernel_regularizer=reg)(x)
+    x = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.5)(x)
 
-    # Resize to grid
+    # Resize feature map to GRID_SIZE × GRID_SIZE
     x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
 
-    # Final prediction: [GRID_SIZE, GRID_SIZE, NUM_ANCHORS * (5 + NUM_CLASSES)]
-    x = layers.Conv2D(NUM_ANCHORS * (5 + num_classes), 1, padding='same',
-                    kernel_regularizer=reg)(x)
-    
-    # Resize to grid
-    x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
-    
-    # Final prediction: [GRID_SIZE, GRID_SIZE, NUM_ANCHORS * (5 + NUM_CLASSES)]
+    # Prediction head
     x = layers.Conv2D(NUM_ANCHORS * (5 + num_classes), 1, padding='same')(x)
-    
-    # Reshape to [GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + NUM_CLASSES]
-    outputs = layers.Reshape((GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + num_classes))(x)
-    
-    model = keras.Model(inputs, outputs)
-    
-    return model
 
+    # Reshape to [GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + num_classes]
+    outputs = layers.Reshape((GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + num_classes))(x)
+
+    return keras.Model(inputs, outputs)
 
 def detection_loss(y_true, y_pred):
-    """
-    Custom detection loss function
-    Combines: objectness loss + bbox regression loss + classification loss
-    """
+    """Custom detection loss function combining objectness, bbox, and classification losses"""
     epsilon = 1e-7
+    
     # Split predictions / ground truth
     obj_true = y_true[..., 0:1]
     box_true = y_true[..., 1:5]
@@ -510,7 +539,7 @@ def detection_loss(y_true, y_pred):
     obj_pred = tf.sigmoid(y_pred[..., 0:1])
     cls_pred = tf.sigmoid(y_pred[..., 5:])
 
-    # For box predictions: tx,ty should be sigmoided to match cell offsets in [0,1]
+    # For box predictions: tx,ty should be sigmoided
     tx_ty_pred = tf.sigmoid(y_pred[..., 1:3])
     tw_th_pred = y_pred[..., 3:5]
     box_pred = tf.concat([tx_ty_pred, tw_th_pred], axis=-1)
@@ -524,21 +553,21 @@ def detection_loss(y_true, y_pred):
     obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
     obj_loss = obj_mask * obj_bce
     noobj_loss = noobj_mask * obj_bce
-    objectness_loss = tf.reduce_mean(obj_loss + 5.0 * noobj_loss)
+    objectness_loss = tf.reduce_mean(obj_loss + 1.5 * noobj_loss)
 
-    # Box regression (only where objects exist)
+    # Box regression
     box_diff = box_true - box_pred
     box_loss = obj_mask * tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
     box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
 
-    # Classification BCE (only where objects exist)
+    # Classification BCE
     cls_pred_clipped = tf.clip_by_value(cls_pred, epsilon, 1 - epsilon)
     cls_bce = -(cls_true * tf.math.log(cls_pred_clipped) + (1 - cls_true) * tf.math.log(1 - cls_pred_clipped))
     cls_loss = obj_mask * tf.reduce_mean(cls_bce, axis=-1, keepdims=True)
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
 
-    # Total loss
-    total_loss = 5.0 * box_loss + objectness_loss + 0.2 * cls_loss
+    # Total loss with weights
+    total_loss = 3.0 * box_loss + objectness_loss + 0.2 * cls_loss
 
     return total_loss
 
@@ -596,9 +625,7 @@ def train_model(model, train_data, val_data, train_loader, val_loader):
 
 
 def decode_predictions(predictions, conf_threshold=CONF_THRESHOLD):
-    """
-    YOLO-style decoding with anchors
-    """
+    """YOLO-style decoding with anchors"""
     boxes = []
     
     if isinstance(predictions, tf.Tensor):
@@ -607,48 +634,52 @@ def decode_predictions(predictions, conf_threshold=CONF_THRESHOLD):
     for i in range(GRID_SIZE):
         for j in range(GRID_SIZE):
             for a in range(NUM_ANCHORS):
-                # Objectness
-                raw_obj = predictions[i, j, a, 0]
-                obj_conf = 1 / (1 + np.exp(-np.clip(raw_obj, -10, 10)))
+                # Objectness confidence
+                obj_logit = np.clip(predictions[i, j, a, 0], -10, 10)
+                obj_conf = 1 / (1 + np.exp(-obj_logit))
+                
                 if obj_conf < conf_threshold:
                     continue
                 
-                # Cell offsets
-                tx = predictions[i, j, a, 1]
-                ty = predictions[i, j, a, 2]
-                cell_x = 1 / (1 + np.exp(-np.clip(tx, -10, 10)))
-                cell_y = 1 / (1 + np.exp(-np.clip(ty, -10, 10)))
+                # Cell-relative offsets [0,1]
+                tx = np.clip(predictions[i, j, a, 1], -10, 10)
+                ty = np.clip(predictions[i, j, a, 2], -10, 10)
+                cell_x = 1 / (1 + np.exp(-tx))
+                cell_y = 1 / (1 + np.exp(-ty))
                 
-                # Width/height with anchors
+                # Box size relative to anchor
                 tw = np.clip(predictions[i, j, a, 3], -10, 10)
                 th = np.clip(predictions[i, j, a, 4], -10, 10)
                 
-                anchor_w = ANCHORS[a][0] / GRID_SIZE
-                anchor_h = ANCHORS[a][1] / GRID_SIZE
+                # Use anchors as image fractions
+                anchor_w = ANCHORS[a][0]
+                anchor_h = ANCHORS[a][1]
                 
                 box_w = anchor_w * np.exp(tw)
                 box_h = anchor_h * np.exp(th)
                 
-                # Convert to image coords
+                # Convert to image coordinates
                 x_center = (j + cell_x) / GRID_SIZE
                 y_center = (i + cell_y) / GRID_SIZE
                 
+                # Convert to pixel coordinates
                 x1 = int((x_center - box_w / 2) * IMG_WIDTH)
                 y1 = int((y_center - box_h / 2) * IMG_HEIGHT)
                 x2 = int((x_center + box_w / 2) * IMG_WIDTH)
                 y2 = int((y_center + box_h / 2) * IMG_HEIGHT)
                 
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                
+                # Clip to image bounds
                 x1 = max(0, min(IMG_WIDTH, x1))
                 y1 = max(0, min(IMG_HEIGHT, y1))
                 x2 = max(0, min(IMG_WIDTH, x2))
                 y2 = max(0, min(IMG_HEIGHT, y2))
                 
-                # Classes
-                class_logits = predictions[i, j, a, 5:]
-                class_probs = 1 / (1 + np.exp(-np.clip(class_logits, -10, 10)))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Class prediction
+                class_logits = np.clip(predictions[i, j, a, 5:], -10, 10)
+                class_probs = 1 / (1 + np.exp(-class_logits))
                 class_id = np.argmax(class_probs)
                 class_conf = class_probs[class_id]
                 
@@ -699,57 +730,33 @@ def compute_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0
 
 
-# def convert_to_tflite(model, output_path='traffic_light_detector.tflite'):
-#     """Convert to TFLite with optimizations"""
-#     converter = tf.lite.TFLiteConverter.from_keras_model(model)
-#     converter.optimizations = [tf.lite.Optimize.DEFAULT]
-#     converter.target_spec.supported_types = [tf.float32]
-    
-#     tflite_model = converter.convert()
-    
-#     with open(output_path, 'wb') as f:
-#         f.write(tflite_model)
-    
-#     print(f"\nTFLite model saved: {output_path}")
-#     print(f"Model size: {len(tflite_model) / 1024:.2f} KB")
-    
-#     return output_path
-
 def convert_to_tflite(model, train_data, loader, output_path='traffic_light_detector.tflite', num_calibration_samples=250):
     """Convert to TFLite with INT8 quantization"""
     
-    # Representative dataset generator for calibration
     def representative_dataset():
         """Generate representative samples for quantization calibration"""
         calibration_samples = random.sample(train_data, min(num_calibration_samples, len(train_data)))
         
         for item in calibration_samples:
-            img = loader.preprocess_image(item['img_path'], item['apply_calibration'])
+            img = loader.preprocess_image(item['img_path'], False)  # No augmentation for calibration
             if img is None:
                 continue
             
-            # Normalize and add batch dimension
             img_normalized = np.expand_dims(img / 255.0, axis=0).astype(np.float32)
             yield [img_normalized]
     
-    # Create converter
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    
-    # Enable INT8 quantization
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative_dataset
     
     # Enforce full integer quantization
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    converter.inference_input_type = tf.uint8  # or tf.int8
-    converter.inference_output_type = tf.uint8  # or tf.int8
+    converter.inference_input_type = tf.uint8
+    converter.inference_output_type = tf.uint8
     
-    # Convert model
-    print("Converting to INT8 quantized TFLite model...")
-    print(f"Using {num_calibration_samples} calibration samples...")
+    print(f"Converting to INT8 quantized TFLite (using {num_calibration_samples} calibration samples)...")
     tflite_model = converter.convert()
     
-    # Save model
     with open(output_path, 'wb') as f:
         f.write(tflite_model)
     
@@ -759,9 +766,7 @@ def convert_to_tflite(model, train_data, loader, output_path='traffic_light_dete
     return output_path
 
 def evaluate_map(results, class_names, iou_threshold=0.5, img_width=IMG_WIDTH, img_height=IMG_HEIGHT):
-    """Compute mAP per class from detection results with proper scaling and class alignment.
-    Computes AP at the requested IoU and also reports AP at IoU=0.3 as a fallback diagnostic.
-    """
+    """Compute mAP per class from detection results"""
     def compute_ap_for_threshold(results, class_names, thresh):
         aps_local = {}
         class_to_idx = {name: idx for idx, name in enumerate(class_names)}
@@ -789,15 +794,7 @@ def evaluate_map(results, class_names, iou_threshold=0.5, img_width=IMG_WIDTH, i
                     }
                     gts.append(scaled_gt)
 
-                # Collect predictions of this class
                 preds.extend([b for b in result['boxes'] if b[5] == class_id])
-
-            # Debug logging
-            print(f"[DEBUG] Class {class_name}: GT={len(gts)} | Pred={len(preds)} (IoU thresh={thresh})")
-            if len(gts) > 0:
-                print(f"  Sample GTs (up to 5): {gts[:5]}")
-            if len(preds) > 0:
-                print(f"  Sample Preds (up to 5): {preds[:5]}")
 
             if len(gts) == 0:
                 continue
@@ -833,96 +830,56 @@ def evaluate_map(results, class_names, iou_threshold=0.5, img_width=IMG_WIDTH, i
         map_local = np.mean(list(aps_local.values())) if aps_local else 0.0
         return aps_local, map_local
 
-    # Primary threshold
     aps_primary, map_primary = compute_ap_for_threshold(results, class_names, iou_threshold)
 
-    # Secondary diagnostic thresholds (lower) to detect small-object matching issues
-    aps_lo, map_lo = ({}, 0.0)
-    aps_lo2, map_lo2 = ({}, 0.0)
-    if iou_threshold != 0.3:
-        aps_lo, map_lo = compute_ap_for_threshold(results, class_names, 0.3)
-    if iou_threshold not in (0.3, 0.1):
-        aps_lo2, map_lo2 = compute_ap_for_threshold(results, class_names, 0.1)
-
-    print("\nPer-class AP (primary):")
+    print("\nPer-class AP:")
     for cls, ap in aps_primary.items():
         print(f"  {cls}: {ap:.3f}")
-    print(f"\nMean Average Precision (mAP) @ {iou_threshold}: {map_primary:.3f}")
-
-    if aps_lo:
-        print(f"\nPer-class AP (IoU=0.3):")
-        for cls, ap in aps_lo.items():
-            print(f"  {cls}: {ap:.3f}")
-        print(f"\nMean Average Precision (mAP) @ 0.3: {map_lo:.3f}")
-
-    if aps_lo2:
-        print(f"\nPer-class AP (IoU=0.1):")
-        for cls, ap in aps_lo2.items():
-            print(f"  {cls}: {ap:.3f}")
-        print(f"\nMean Average Precision (mAP) @ 0.1: {map_lo2:.3f}")
+    print(f"\nmAP @ IoU={iou_threshold}: {map_primary:.3f}")
 
     return aps_primary, map_primary
 
 def test_tflite_model(tflite_path, test_data, class_names, num_samples=30):
-    """Test TFLite detection model (handles both float32 and int8 quantized models)"""
+    """Test TFLite detection model"""
     interpreter = tf.lite.Interpreter(model_path=tflite_path)
     interpreter.allocate_tensors()
     
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
     
-    # Check model type
     input_dtype = input_details[0]['dtype']
-    output_dtype = output_details[0]['dtype']
     is_quantized = input_dtype == np.uint8 or input_dtype == np.int8
-    is_float16 = input_dtype == np.float16
     
     if is_quantized:
-        print(f"Detected INT8 quantized model")
-        print(f"Input type: {input_dtype}, Output type: {output_dtype}")
-        
-        # Get quantization parameters
         input_scale, input_zero_point = input_details[0]['quantization']
         output_scale, output_zero_point = output_details[0]['quantization']
-        print(f"Input scale: {input_scale}, zero_point: {input_zero_point}")
-        print(f"Output scale: {output_scale}, zero_point: {output_zero_point}")
-    elif is_float16:
-        print(f"Detected FLOAT16 model")
-        print(f"Input type: {input_dtype}, Output type: {output_dtype}")
+        print(f"INT8 quantized model detected")
     else:
-        print(f"Detected FLOAT32 model")
-        print(f"Input type: {input_dtype}, Output type: {output_dtype}")
+        print(f"FLOAT32 model detected")
     
     loader = LISADetectionDataLoader(DATASET_ROOT, ANNOTATIONS_ROOT)
+    loader.anchors = ANCHORS  # Use computed anchors
     
-    # Sample random images
     random_samples = random.sample(test_data, min(num_samples, len(test_data)))
     
     print(f"\n{'='*80}")
-    print(f"Testing TFLite Detection Model on {len(random_samples)} samples")
+    print(f"Testing TFLite Model on {len(random_samples)} samples")
     print(f"{'='*80}\n")
     
     results = []
     
     for idx, item in enumerate(random_samples):
-        img = loader.preprocess_image(item['img_path'], item['apply_calibration'])
+        img = loader.preprocess_image(item['img_path'], False)  # No augmentation for testing
         
         if img is None:
             continue
         
-        # Prepare input based on model type
+        # Prepare input
         if is_quantized:
-            # For quantized models: normalize to [0, 255] then quantize
-            img_normalized = img.astype(np.float32)  # Already in [0, 255] range
-            
-            # Quantize: scale and add zero point
+            img_normalized = img.astype(np.float32)
             input_data = (img_normalized / input_scale + input_zero_point).astype(input_dtype)
             input_data = np.expand_dims(input_data, axis=0)
-        elif is_float16:
-            # For float16 models: normalize to [0, 1] and cast to float16
-            input_data = np.expand_dims(img / 255.0, axis=0).astype(np.float16)
         else:
-            # For float32 models: normalize to [0, 1]
             input_data = np.expand_dims(img / 255.0, axis=0).astype(np.float32)
         
         # Run inference
@@ -930,33 +887,25 @@ def test_tflite_model(tflite_path, test_data, class_names, num_samples=30):
         interpreter.invoke()
         predictions = interpreter.get_tensor(output_details[0]['index'])[0]
         
-        # Dequantize output if needed
+        # Dequantize if needed
         if is_quantized:
-            # Dequantize: (quantized_value - zero_point) * scale
             predictions = (predictions.astype(np.float32) - output_zero_point) * output_scale
-        elif is_float16:
-            # Convert float16 to float32 for processing
-            predictions = predictions.astype(np.float32)
         
         # Decode predictions
         boxes = decode_predictions(predictions)
         boxes = non_max_suppression(boxes)
         
-        # Count detections per class
+        # Count detections
         detections = {}
         for box in boxes:
             class_id = int(box[5])
             class_name = class_names[class_id]
             detections[class_name] = detections.get(class_name, 0) + 1
         
-        # Ground truth count
-        gt_count = len(item['boxes'])
-        pred_count = len(boxes)
-        
         results.append({
             'filename': item['filename'],
-            'ground_truth_count': gt_count,
-            'predicted_count': pred_count,
+            'ground_truth_count': len(item['boxes']),
+            'predicted_count': len(boxes),
             'detections': detections,
             'boxes': boxes,
             'image': img,
@@ -965,54 +914,8 @@ def test_tflite_model(tflite_path, test_data, class_names, num_samples=30):
             'orig_h': item['orig_h']
         })
         
-        # Print result
         det_str = ', '.join([f"{k}:{v}" for k, v in detections.items()]) if detections else "none"
-        print(f"{idx+1:2d}. {item['filename']:35s} | GT: {gt_count} | Pred: {pred_count} | {det_str}")
-    
-    print(f"\n{'='*80}\n")
-    
-    return results
-    
-    for idx, item in enumerate(random_samples):
-        img = loader.preprocess_image(item['img_path'], item['apply_calibration'])
-        
-        if img is None:
-            continue
-        
-        # Run inference
-        input_data = np.expand_dims(img / 255.0, axis=0).astype(np.float32)
-        interpreter.set_tensor(input_details[0]['index'], input_data)
-        interpreter.invoke()
-        predictions = interpreter.get_tensor(output_details[0]['index'])[0]
-        
-        # Decode predictions
-        boxes = decode_predictions(predictions)
-        boxes = non_max_suppression(boxes)
-        
-        # Count detections per class
-        detections = {}
-        for box in boxes:
-            class_id = int(box[5])
-            class_name = class_names[class_id]
-            detections[class_name] = detections.get(class_name, 0) + 1
-        
-        # Ground truth count
-        gt_count = len(item['boxes'])
-        pred_count = len(boxes)
-        
-        results.append({
-            'filename': item['filename'],
-            'ground_truth_count': gt_count,
-            'predicted_count': pred_count,
-            'detections': detections,
-            'boxes': boxes,
-            'image': img,
-            'gt_boxes': item['boxes']
-        })
-        
-        # Print result
-        det_str = ', '.join([f"{k}:{v}" for k, v in detections.items()]) if detections else "none"
-        print(f"{idx+1:2d}. {item['filename']:35s} | GT: {gt_count} | Pred: {pred_count} | {det_str}")
+        print(f"{idx+1:2d}. {item['filename']:35s} | GT: {len(item['boxes'])} | Pred: {len(boxes)} | {det_str}")
     
     print(f"\n{'='*80}\n")
     
@@ -1031,26 +934,22 @@ def visualize_detections(results, num_display=6):
         ax = axes[idx]
         ax.imshow(result['image'])
         
-        # Get ORIGINAL dimensions (before resize)
         orig_w = result.get('orig_w')
         orig_h = result.get('orig_h')
         
         if orig_w is None or orig_h is None:
-            # Fallback: assume standard LISA dimensions
             orig_w, orig_h = 1280, 960
         
-        # Scale factors: original -> resized
-        scale_x = IMG_WIDTH / orig_w   # e.g., 640/1280 = 0.5
-        scale_y = IMG_HEIGHT / orig_h  # e.g., 480/960 = 0.5
+        scale_x = IMG_WIDTH / orig_w
+        scale_y = IMG_HEIGHT / orig_h
         
-        # Draw ground truth (green) - boxes are in ORIGINAL coordinates
+        # Draw ground truth (green)
         for box in result['gt_boxes']:
             x1 = int(box['x1'] * scale_x)
             y1 = int(box['y1'] * scale_y)
             x2 = int(box['x2'] * scale_x)
             y2 = int(box['y2'] * scale_y)
             
-            # Clip to image bounds
             x1 = max(0, min(IMG_WIDTH, x1))
             y1 = max(0, min(IMG_HEIGHT, y1))
             x2 = max(0, min(IMG_WIDTH, x2))
@@ -1061,14 +960,9 @@ def visualize_detections(results, num_display=6):
                                      edgecolor='green', facecolor='none', label='GT')
             ax.add_patch(rect)
         
-        # Draw predictions (red) - already in resized coordinates
+        # Draw predictions (red)
         for box in result['boxes']:
             x1, y1, x2, y2, conf, class_id = box
-            x1 = max(0, min(IMG_WIDTH, x1))
-            y1 = max(0, min(IMG_HEIGHT, y1))
-            x2 = max(0, min(IMG_WIDTH, x2))
-            y2 = max(0, min(IMG_HEIGHT, y2))
-            
             w, h = x2 - x1, y2 - y1
             rect = patches.Rectangle((x1, y1), w, h, linewidth=2,
                                      edgecolor='red', facecolor='none')
@@ -1093,11 +987,11 @@ def main():
     print("="*80)
     print("LISA Traffic Light DETECTION + CLASSIFICATION System")
     print("TensorFlow Version:", tf.__version__)
-    print(f"MAX_SAMPLES: {MAX_SAMPLES}")
+    print(f"Configuration: MAX_SAMPLES={MAX_SAMPLES}, EPOCHS={EPOCHS}, BATCH_SIZE={BATCH_SIZE}")
     print("="*80)
     
-    # Load dataset
-    print("\n[1/6] Loading dataset...")
+    # Load dataset and compute optimal anchors
+    print("\n[1/6] Loading dataset and computing optimal anchors...")
     loader = LISADetectionDataLoader(DATASET_ROOT, ANNOTATIONS_ROOT)
     all_data = loader.load_dataset()
     print(f"Total images: {len(all_data)}")
@@ -1109,7 +1003,7 @@ def main():
     print(f"Training images: {len(train_data)}")
     print(f"Test images: {len(test_data)}")
     
-    # Create dataset metadata (not loading images yet)
+    # Create dataset metadata
     print("\n[2/6] Validating dataset...")
     train_items = loader.create_dataset(train_data, apply_calibration=True)
     test_items = loader.create_dataset(test_data, apply_calibration=False)
@@ -1119,7 +1013,7 @@ def main():
         train_items, test_size=0.2, random_state=42
     )
 
-    # Disable color calibration for validation to avoid stochastic noise mismatch
+    # Disable augmentation for validation
     for item in val_items:
         item['apply_calibration'] = False
     
@@ -1133,21 +1027,12 @@ def main():
     model = create_detection_model(num_classes=loader.num_classes)
     model.summary()
     
-    # Train using generators (memory efficient)
-    print("\n[4/6] Training model (using data generators)...")
+    # Train
+    print("\n[4/6] Training model...")
     history = train_model(model, train_items, val_items, loader, loader)
 
-    # Test Keras model directly
-    print("\n[Testing Keras model directly]")
-    test_item = random.choice(test_items)
-    img = loader.preprocess_image(test_item['img_path'], True)
-    preds = model.predict(np.expand_dims(img/255.0, axis=0))[0]
-    boxes = decode_predictions(preds, conf_threshold=CONF_THRESHOLD)
-    print(f"Keras model found {len(boxes)} boxes")
-    
     # Convert to TFLite
     print("\n[5/6] Converting to TFLite...")
-    # tflite_path = convert_to_tflite(model)
     tflite_path = convert_to_tflite(model, train_items, loader)
     
     # Test
@@ -1161,6 +1046,7 @@ def main():
     print("\n" + "="*80)
     print("Training complete!")
     print(f"Model saved: {tflite_path}")
+    print(f"Final mAP: {map_score:.3f}")
     print("="*80)
 
 
