@@ -28,13 +28,13 @@ GRID_SIZE = 8  # Divide image into 16x16 grid
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
-BATCH_SIZE = 8
-EPOCHS = 15
-LEARNING_RATE = 0.0005
+BATCH_SIZE = 16
+EPOCHS = 30
+LEARNING_RATE = 0.001
 IOU_THRESHOLD_EVAL = 0.25  # En vez de 0.3
 IOU_THRESHOLD_NMS = 0.2    # Para NMS más agresivo
 CONF_THRESHOLD = 0.75 # 0.75 reduced for testing
-MAX_SAMPLES = 12000  # Limit total samples to prevent memory issues
+MAX_SAMPLES = 20000  # Limit total samples to prevent memory issues
 
 # Dataset paths
 DATASET_ROOT = "LISA Traffic Light Dataset"
@@ -534,7 +534,7 @@ def create_detection_model(num_classes):
         alpha=0.5
     )
     backbone.trainable = True
-    for layer in backbone.layers[:-20]:
+    for layer in backbone.layers[:-10]:
         layer.trainable = False
 
     x = backbone(inputs, training=False)
@@ -542,10 +542,10 @@ def create_detection_model(num_classes):
     reg = keras.regularizers.l2(5e-4)
     x = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)
+    x = layers.Dropout(0.2)(x)
     x = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)
+    x = layers.Dropout(0.2)(x)
 
     # Resize feature map to GRID_SIZE × GRID_SIZE
     x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
