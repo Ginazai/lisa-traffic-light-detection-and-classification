@@ -28,9 +28,9 @@ GRID_SIZE = 8  # Divide image into 16x16 grid
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 EPOCHS = 30
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005
 IOU_THRESHOLD_EVAL = 0.25  # En vez de 0.3
 IOU_THRESHOLD_NMS = 0.2    # Para NMS más agresivo
 CONF_THRESHOLD = 0.75 # 0.75 reduced for testing
@@ -534,7 +534,7 @@ def create_detection_model(num_classes):
         alpha=0.5
     )
     backbone.trainable = True
-    for layer in backbone.layers[:-10]:
+    for layer in backbone.layers[:-20]:
         layer.trainable = False
 
     x = backbone(inputs, training=False)
@@ -542,10 +542,10 @@ def create_detection_model(num_classes):
     reg = keras.regularizers.l2(5e-4)
     x = layers.Conv2D(256, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.2)(x)
+    x = layers.Dropout(0.5)(x)
     x = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.2)(x)
+    x = layers.Dropout(0.5)(x)
 
     # Resize feature map to GRID_SIZE × GRID_SIZE
     x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
@@ -561,15 +561,12 @@ def create_detection_model(num_classes):
 def detection_loss(y_true, y_pred):
     """Custom detection loss function combining objectness, bbox, and classification losses"""
     epsilon = 1e-7
-
-    class_weights = tf.constant([
-        1.0,    # go (baseline)
-        16.9,   # goLeft (254/15)
-        1.14,   # stop (254/222)
-        2.47,   # stopLeft (254/103)
-        8.19,   # warning (254/31)
-        23.1    # warningLeft (254/11)
-    ], dtype=tf.float32)
+    # Class weights SUAVIZADOS con raíz cuadrada
+    raw_weights = np.array([1.0, 16.9, 1.14, 2.47, 8.19, 23.1])
+    
+    # Suaviza con sqrt para reducir extremos
+    class_weights = tf.constant(np.sqrt(raw_weights), dtype=tf.float32)
+    # Resultado: [1.0, 4.11, 1.07, 1.57, 2.86, 4.81]
     
     # Split predictions / ground truth
     obj_true = y_true[..., 0:1]
@@ -614,7 +611,7 @@ def detection_loss(y_true, y_pred):
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
     
     # Aumenta peso de box loss por IoU bajo
-    total_loss = 3.0 * box_loss + 2.0 * objectness_loss + 2.5 * cls_loss
+    total_loss = 2.5 * box_loss + 2.0 * objectness_loss + 1.5 * cls_loss 
     
     return total_loss
 
