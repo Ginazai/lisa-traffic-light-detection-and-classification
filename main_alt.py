@@ -30,11 +30,11 @@ CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
 BATCH_SIZE = 8
 EPOCHS = 30
-LEARNING_RATE = 0.0005
-IOU_THRESHOLD_EVAL = 0.25  # En vez de 0.3
-IOU_THRESHOLD_NMS = 0.2    # Para NMS más agresivo
+LEARNING_RATE = 0.00025
+IOU_THRESHOLD_EVAL = 0.25 
+IOU_THRESHOLD_NMS = 0.2    # NMS agresivo
 CONF_THRESHOLD = 0.75 # 0.75 reduced for testing
-MAX_SAMPLES = 20000  # Limit total samples to prevent memory issues
+MAX_SAMPLES = 18637 # Total Lisa Traffic Light Dataset samples
 
 # Dataset paths
 DATASET_ROOT = "LISA Traffic Light Dataset"
@@ -534,7 +534,7 @@ def create_detection_model(num_classes):
         alpha=0.5
     )
     backbone.trainable = True
-    for layer in backbone.layers[:-20]:
+    for layer in backbone.layers[:-30]:
         layer.trainable = False
 
     x = backbone(inputs, training=False)
@@ -562,7 +562,14 @@ def detection_loss(y_true, y_pred):
     """Custom detection loss function combining objectness, bbox, and classification losses"""
     epsilon = 1e-7
     # Class weights SUAVIZADOS con raíz cuadrada
-    raw_weights = np.array([1.0, 16.9, 1.14, 2.47, 8.19, 23.1])
+    raw_weights = np.array([
+        1.0,   # go
+        1.5,   # goLeft (era 2.0)
+        1.0,   # stop  
+        1.3,   # stopLeft (era 2.0)
+        3.0,   # warning (era 8.0)
+        4.0    # warningLeft (era 16.0)
+    ])
     
     # Suaviza con sqrt para reducir extremos
     class_weights = tf.constant(np.sqrt(raw_weights), dtype=tf.float32)
@@ -611,7 +618,7 @@ def detection_loss(y_true, y_pred):
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
     
     # Aumenta peso de box loss por IoU bajo
-    total_loss = 2.5 * box_loss + 2.0 * objectness_loss + 1.5 * cls_loss 
+    total_loss = 3.5 * box_loss + 2.0 * objectness_loss + 1.5 * cls_loss
     
     return total_loss
 
