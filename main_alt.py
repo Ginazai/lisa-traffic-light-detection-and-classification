@@ -254,7 +254,7 @@ class LISADetectionDataLoader:
             print(f"  Anchor {i}: [{w_px:.1f}px, {h_px:.1f}px]")
     
     def load_dataset(self):
-        """Load all annotations from dataset"""
+        """Load all annotations from dataset - NO SPLIT, just load everything"""
         all_data = []
         
         # Training data - day
@@ -271,8 +271,8 @@ class LISADetectionDataLoader:
                             all_data.append({
                                 'filename': filename,
                                 'img_dir': img_dir,
-                                'boxes': boxes,
-                                'split': 'train'
+                                'boxes': boxes
+                                # ← REMOVED 'split': 'train'
                             })
         
         # Training data - night
@@ -289,11 +289,11 @@ class LISADetectionDataLoader:
                             all_data.append({
                                 'filename': filename,
                                 'img_dir': img_dir,
-                                'boxes': boxes,
-                                'split': 'train'
+                                'boxes': boxes
+                                # ← REMOVED 'split': 'train'
                             })
         
-        # Test sequences
+        # Test sequences - NOW INCLUDED IN TRAINING!
         for seq in ['daySequence1', 'daySequence2', 'nightSequence1', 'nightSequence2']:
             seq_path = os.path.join(self.annotations_root, seq)
             if os.path.exists(seq_path):
@@ -305,11 +305,11 @@ class LISADetectionDataLoader:
                         all_data.append({
                             'filename': filename,
                             'img_dir': img_dir,
-                            'boxes': boxes,
-                            'split': 'test'
+                            'boxes': boxes
+                            # ← REMOVED 'split': 'test'
                         })
 
-        # Compute optimal anchors from all data
+        # Compute optimal anchors from ALL data
         self.compute_optimal_anchors(all_data)
         
         # Set global ANCHORS variable
@@ -1233,7 +1233,7 @@ def debug_predictions_detailed(model, test_data, loader, num_samples=3):
             print(f"    {gt['class']}: {size} píxeles")
 
 def main():
-    """Main training pipeline"""
+    """Main training pipeline - FIXED VERSION"""
     print("="*80)
     print("LISA Traffic Light DETECTION + CLASSIFICATION System")
     print("TensorFlow Version:", tf.__version__)
@@ -1241,36 +1241,68 @@ def main():
     print("="*80)
     
     # Load dataset and compute optimal anchors
-    print("\n[1/6] Loading dataset and computing optimal anchors...")
+    print("\n[1/6] Loading ALL dataset (train + test sequences)...")
     loader = LISADetectionDataLoader(DATASET_ROOT, ANNOTATIONS_ROOT)
-    all_data = loader.load_dataset()
-    print(f"Total images: {len(all_data)}")
+    all_data = loader.load_dataset()  # ← This now includes EVERYTHING
+    print(f"Total images loaded: {len(all_data)}")
     
-    # Split data
-    train_data = [d for d in all_data if d['split'] == 'train']
-    test_data = [d for d in all_data if d['split'] == 'test']
+    # ==========================================
+    # KEY CHANGE: Random split instead of using predefined 'split' field
+    # ==========================================
     
-    print(f"Training images: {len(train_data)}")
-    print(f"Test images: {len(test_data)}")
+    print("\n[2/6] Creating train/val/test split from ALL data...")
     
-    # Create dataset metadata
-    print("\n[2/6] Validating dataset...")
-    train_items = loader.create_dataset(train_data, apply_calibration=True)
-    test_items = loader.create_dataset(test_data, apply_calibration=False)
+    # First, create dataset metadata (validate images exist)
+    all_items = loader.create_dataset(all_data, apply_calibration=True)
+    print(f"Valid samples: {len(all_items)}")
     
-    # Split training into train/val
-    train_items, val_items = train_test_split(
-        train_items, test_size=0.2, random_state=42
+    # Split: 70% train, 15% val, 15% test
+    from sklearn.model_selection import train_test_split
+    
+    # First split: 70% train+val, 30% test
+    train_val_items, test_items = train_test_split(
+        all_items, 
+        test_size=0.15,  # 15% for test
+        random_state=42,
+        shuffle=True
     )
-
-    # Disable augmentation for validation
-    for item in val_items:
+    
+    # Second split: split train+val into 70% train, 15% val
+    train_items, val_items = train_test_split(
+        train_val_items,
+        test_size=0.176,  # 0.176 * 0.85 ≈ 0.15 of total
+        random_state=42,
+        shuffle=True
+    )
+    
+    # Disable augmentation for validation and test
+    for item in val_items + test_items:
         item['apply_calibration'] = False
     
-    print(f"\nDataset sizes:")
-    print(f"  Train: {len(train_items)}")
-    print(f"  Val: {len(val_items)}")
-    print(f"  Test: {len(test_items)}")
+    print(f"\n✅ Dataset split complete:")
+    print(f"  Train: {len(train_items)} ({100*len(train_items)/len(all_items):.1f}%)")
+    print(f"  Val:   {len(val_items)} ({100*len(val_items)/len(all_items):.1f}%)")
+    print(f"  Test:  {len(test_items)} ({100*len(test_items)/len(all_items):.1f}%)")
+    
+    # Verify the split includes all sequences
+    print("\n📊 Checking data distribution:")
+    for split_name, split_data in [("Train", train_items), ("Val", val_items), ("Test", test_items)]:
+        sources = {}
+        for item in split_data:
+            # Extract source from img_dir
+            if 'dayTrain' in item['img_dir']:
+                source = 'dayTrain'
+            elif 'nightTrain' in item['img_dir']:
+                source = 'nightTrain'
+            elif 'daySequence' in item['img_dir']:
+                source = 'daySequence'
+            elif 'nightSequence' in item['img_dir']:
+                source = 'nightSequence'
+            else:
+                source = 'unknown'
+            sources[source] = sources.get(source, 0) + 1
+        
+        print(f"  {split_name}: {', '.join([f'{k}:{v}' for k,v in sources.items()])}")
     
     # Create model
     print("\n[3/6] Creating detection model...")
@@ -1285,19 +1317,43 @@ def main():
     print("\n[5/6] Converting to TFLite...")
     tflite_path = convert_to_tflite(model, train_items, loader)
     
-    # Test
-    print("\n[6/6] Testing detection model...")
-    results = test_tflite_model(tflite_path, test_items, loader.class_names, num_samples=30)
-    aps, map_score = evaluate_map(results, loader.class_names, verbose=True)
-    #debug_map_coordinates(results, num_samples=5)
+    # Test on the HELD-OUT test set
+    print("\n[6/6] Testing on held-out test set...")
+    
+    # First test Keras model
+    print("\n--- Testing Keras Model on Test Set ---")
+    keras_test_results = []
+    for item in test_items[:30]:  # Test on 30 samples
+        img = loader.preprocess_image(item['img_path'], False)
+        if img is None:
+            continue
+        preds = model.predict(np.expand_dims(img/255.0, axis=0), verbose=0)[0]
+        boxes = decode_predictions(preds)
+        boxes = non_max_suppression(boxes)
+        keras_test_results.append({
+            'filename': item['filename'],
+            'boxes': boxes,
+            'gt_boxes': item['boxes'],
+            'orig_w': item['orig_w'],
+            'orig_h': item['orig_h']
+        })
+    
+    keras_aps, keras_map = evaluate_map(keras_test_results, loader.class_names, verbose=True)
+    
+    # Then test TFLite model
+    print("\n--- Testing TFLite Model on Test Set ---")
+    tflite_test_results = test_tflite_model(tflite_path, test_items, loader.class_names, num_samples=30)
+    tflite_aps, tflite_map = evaluate_map(tflite_test_results, loader.class_names, verbose=True)
 
     # Visualize
-    visualize_detections(results)
+    visualize_detections(keras_test_results, num_display=6)
     
     print("\n" + "="*80)
-    print("Training complete!")
+    print("✅ TRAINING COMPLETE!")
+    print("="*80)
+    print(f"Keras model mAP (test):  {keras_map:.3f}")
+    print(f"TFLite model mAP (test): {tflite_map:.3f}")
     print(f"Model saved: {tflite_path}")
-    print(f"Final mAP: {map_score:.3f}")
     print("="*80)
 
 
