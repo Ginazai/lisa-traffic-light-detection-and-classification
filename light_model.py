@@ -24,16 +24,16 @@ from datetime import datetime
 # Configuration
 IMG_HEIGHT = 240
 IMG_WIDTH = 320
-GRID_SIZE = 8  # Divide image into 16x16 grid
+GRID_SIZE = 16  # Divide image into 16x16 grid
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
 BATCH_SIZE = 8
 EPOCHS = 30
-LEARNING_RATE = 0.00025
+LEARNING_RATE = 0.0005
 IOU_THRESHOLD_EVAL = 0.25 
-IOU_THRESHOLD_NMS = 0.2    # NMS agresivo
-CONF_THRESHOLD = 0.75 # 0.75 reduced for testing
+IOU_THRESHOLD_NMS = 0.3    # NMS agresivo
+CONF_THRESHOLD = 0.6 # 0.75 reduced for testing
 MAX_SAMPLES = 36775 # Total Lisa Traffic Light Dataset samples (36775 total)
 
 # Knowledge Distillation & QAT config
@@ -390,45 +390,24 @@ class LISADetectionDataLoader:
         return target
     
     def preprocess_image(self, img_path, apply_calibration=True, boxes=None):
-        """Load and preprocess full image
-        Note: 'boxes' is optional and used only by some augmentations (copy-paste)."""
         img = cv2.imread(img_path)
-        
         if img is None:
             return None
 
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
-        img = random_scale_and_crop(img, IMG_HEIGHT, IMG_WIDTH)
+        img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
 
-        # Prepare local boxes for augmentations (caller may not pass GT boxes)
         boxes_local = boxes if boxes is not None else []
 
         if apply_calibration:
             img = apply_ov2640_color_calibration(img, add_noise=True)
-            img = photometric(img)
-            # Random brightness jitter and copy-paste augment
-            if random.random() < 0.5:
+        
+            # MINIMAL augmentation to start
+            if random.random() < 0.3:  # Reduced from 0.6
+                img = photometric(img)
+        
+            if random.random() < 0.3:  # Reduced from 0.5
                 img, boxes_local = copy_paste_augment(img, boxes_local, self)
-                factor = 1.0 + np.random.uniform(-0.2, 0.2)
-                img = np.clip(img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
-
-            # Random HSV/value jitter
-            if random.random() < 0.5:
-                hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
-                hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1.0 + np.random.uniform(-0.15, 0.15)), 0, 255)
-                hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + np.random.uniform(-0.1, 0.1)), 0, 255)
-                img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-            # Small Gaussian blur sometimes
-            if random.random() < 0.3:
-                k = random.choice([3, 5])
-                img = cv2.GaussianBlur(img, (k, k), 0)
-
-            # Add small Gaussian noise
-            if random.random() < 0.3:
-                noise = np.random.normal(0, 4, img.shape).astype(np.float32)
-                img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
         return img
     
@@ -546,8 +525,9 @@ def classification_accuracy(y_true, y_pred):
     return tf.reduce_sum(correct) / (tf.reduce_sum(tf.cast(obj_mask, tf.float32)) + 1e-7)
 
 def create_detection_model(num_classes):
-    """Create lightweight detection model with MobileNetV2 backbone"""
+    """Create lightweight detection model optimized for tiny objects"""
     inputs = keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
+    
     backbone = keras.applications.MobileNetV2(
         input_shape=(IMG_HEIGHT, IMG_WIDTH, 3),
         include_top=False,
@@ -560,89 +540,76 @@ def create_detection_model(num_classes):
 
     x = backbone(inputs, training=False)
 
+    # Simpler head
     reg = keras.regularizers.l2(5e-4)
+    
     x = layers.Conv2D(64, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)
-    x = layers.Conv2D(32, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
+    x = layers.Dropout(0.4)(x)
+    
+    x = layers.Conv2D(48, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)
+    x = layers.Dropout(0.4)(x)
 
-    # Resize feature map to GRID_SIZE × GRID_SIZE
-    x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
-
-    # Prediction head
+    # Resize to grid
+    x = layers.Resizing(GRID_SIZE, GRID_SIZE, interpolation='bilinear')(x)
+    
+    # Final prediction head
     x = layers.Conv2D(NUM_ANCHORS * (5 + num_classes), 1, padding='same')(x)
-
-    # Reshape to [GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + num_classes]
     outputs = layers.Reshape((GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + num_classes))(x)
 
     return keras.Model(inputs, outputs)
 
 def detection_loss(y_true, y_pred):
-    """Custom detection loss function combining objectness, bbox, and classification losses"""
     epsilon = 1e-7
-    # Class weights SUAVIZADOS con raíz cuadrada
-    raw_weights = np.array([
-        1.3,   # go
-        1.5,   # goLeft (era 2.0)
-        1.3,   # stop  
-        1.3,   # stopLeft (era 2.0)
-        3.0,   # warning (era 8.0)
-        4.0    # warningLeft (era 16.0)
-    ])
     
-    # Suaviza con sqrt para reducir extremos
-    class_weights = tf.constant(np.sqrt(raw_weights), dtype=tf.float32)
-    # Resultado: [1.0, 4.11, 1.07, 1.57, 2.86, 4.81]
+    # FLATTEN class weights - extreme weights cause issues
+    class_weights = tf.constant([1.0, 1.0, 1.0, 1.0, 1.5, 2.0], dtype=tf.float32)
     
-    # Split predictions / ground truth
     obj_true = y_true[..., 0:1]
     box_true = y_true[..., 1:5]
     cls_true = y_true[..., 5:]
-
-    # Predicted: apply sigmoid for objectness and class logits
+    
     obj_pred = tf.sigmoid(y_pred[..., 0:1])
     cls_pred = tf.sigmoid(y_pred[..., 5:])
-
-    # For box predictions: tx,ty should be sigmoided
+    
     tx_ty_pred = tf.sigmoid(y_pred[..., 1:3])
     tw_th_pred = y_pred[..., 3:5]
     box_pred = tf.concat([tx_ty_pred, tw_th_pred], axis=-1)
-
-    # Masks
+    
     obj_mask = obj_true
     noobj_mask = 1 - obj_true
-
-    # Objectness BCE
-    obj_pred_clipped = tf.clip_by_value(obj_pred, epsilon, 1 - epsilon)
-    obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
     
-    # CAMBIO CLAVE: Aumenta el peso de los positivos
-    obj_loss = obj_mask * obj_bce * 5.0  # Peso extra para objectness positivo
-    noobj_loss = noobj_mask * obj_bce * 0.5  # Reduce peso de negativos
+    # Simple BCE for objectness
+    obj_pred_clipped = tf.clip_by_value(obj_pred, epsilon, 1 - epsilon)
+    obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + 
+                (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
+    
+    # MASSIVELY INCREASE positive objectness weight
+    obj_loss = obj_mask * obj_bce * 50.0  # Was 10.0 - CRITICAL
+    noobj_loss = noobj_mask * obj_bce * 0.5
     objectness_loss = tf.reduce_mean(obj_loss + noobj_loss)
-
-    # Box regression (sin cambios)
+    
+    # Box loss
     box_diff = box_true - box_pred
-    box_loss = obj_mask * tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
+    mse_loss = tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
+    size_diff = box_true[..., 2:4] - box_pred[..., 2:4]
+    size_penalty = tf.reduce_sum(tf.square(size_diff), axis=-1, keepdims=True) * 2.0
+    box_loss = obj_mask * (mse_loss + size_penalty)
     box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
-
-    # Classification BCE WITH WEIGHTS
+    
+    # Classification loss
     cls_pred_clipped = tf.clip_by_value(cls_pred, epsilon, 1 - epsilon)
     cls_bce = -(cls_true * tf.math.log(cls_pred_clipped) + 
                 (1 - cls_true) * tf.math.log(1 - cls_pred_clipped))
-    
-    # Apply per-class weights
     weighted_cls_bce = cls_bce * tf.expand_dims(class_weights, axis=0)
     cls_loss = obj_mask * tf.reduce_mean(weighted_cls_bce, axis=-1, keepdims=True)
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
     
-    # Aumenta peso de box loss por IoU bajo
-    total_loss = 3.5 * box_loss + 2.0 * objectness_loss + 1.5 * cls_loss
+    # CRITICAL: Objectness must DOMINATE early training
+    total_loss = 3.0 * box_loss + 10.0 * objectness_loss + 1.0 * cls_loss
     
     return total_loss
-
 
 def train_model(model, train_data, val_data, train_loader, val_loader):
     """Train detection model using data generators"""
