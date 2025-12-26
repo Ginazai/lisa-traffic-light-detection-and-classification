@@ -22,29 +22,20 @@ import matplotlib.patches as patches
 from datetime import datetime
 
 # Configuration
+# could test 352 x 288 for better accuracy
 IMG_HEIGHT = 240
 IMG_WIDTH = 320
-GRID_SIZE = 16  # Divide image into 16x16 grid
+GRID_SIZE = 16
 CELL_HEIGHT = IMG_HEIGHT // GRID_SIZE
 CELL_WIDTH = IMG_WIDTH // GRID_SIZE
 NUM_ANCHORS = 4
 BATCH_SIZE = 8
-EPOCHS = 30
-LEARNING_RATE = 0.0005
+EPOCHS = 60
+LEARNING_RATE = 0.0002
 IOU_THRESHOLD_EVAL = 0.25 
-IOU_THRESHOLD_NMS = 0.3    # NMS agresivo
-CONF_THRESHOLD = 0.6 # 0.75 reduced for testing
+IOU_THRESHOLD_NMS = 0.2    # aggresive NMS 
+CONF_THRESHOLD = 0.5 # 0.75 reduced for testing
 MAX_SAMPLES = 36775 # Total Lisa Traffic Light Dataset samples (36775 total)
-
-# Knowledge Distillation & QAT config
-DO_DISTILL = True           # Run teacher->student distillation after baseline training
-DISTILL_TEMPERATURE = 2.0   # Softening temperature for distillation
-DISTILL_ALPHA = 0.5         # Weighting between hard loss and soft (0..1)
-STUDENT_ALPHA = 0.35        # MobileNet alpha for student
-STUDENT_HEAD1 = 32          # Student head conv filters
-STUDENT_HEAD2 = 16
-DO_QAT = True               # Apply QAT fine-tuning to the student
-QAT_EPOCHS = 5              # Short fine-tune epochs with QAT
 
 # Dataset paths
 DATASET_ROOT = "LISA Traffic Light Dataset"
@@ -265,9 +256,6 @@ class LISADetectionDataLoader:
     
     def load_dataset(self):
         """Load all annotations from dataset - NO SPLIT, just load everything"""
-        # Return cached data if already loaded (avoid recomputing anchors repeatedly)
-        if getattr(self, '_all_data', None) is not None:
-            return self._all_data
         all_data = []
         
         # Training data - day
@@ -389,25 +377,40 @@ class LISADetectionDataLoader:
         
         return target
     
-    def preprocess_image(self, img_path, apply_calibration=True, boxes=None):
+    def preprocess_image(self, img_path, apply_calibration=True):
+        """Load and preprocess full image"""
         img = cv2.imread(img_path)
+        
         if img is None:
             return None
 
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
 
-        boxes_local = boxes if boxes is not None else []
-
         if apply_calibration:
             img = apply_ov2640_color_calibration(img, add_noise=True)
-        
-            # MINIMAL augmentation to start
-            if random.random() < 0.3:  # Reduced from 0.6
-                img = photometric(img)
-        
-            if random.random() < 0.3:  # Reduced from 0.5
-                img, boxes_local = copy_paste_augment(img, boxes_local, self)
+            
+            # Random brightness jitter
+            if random.random() < 0.5:
+                factor = 1.0 + np.random.uniform(-0.2, 0.2)
+                img = np.clip(img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+
+            # Random HSV/value jitter
+            if random.random() < 0.5:
+                hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+                hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1.0 + np.random.uniform(-0.15, 0.15)), 0, 255)
+                hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + np.random.uniform(-0.1, 0.1)), 0, 255)
+                img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+            # Small Gaussian blur sometimes
+            if random.random() < 0.3:
+                k = random.choice([3, 5])
+                img = cv2.GaussianBlur(img, (k, k), 0)
+
+            # Add small Gaussian noise
+            if random.random() < 0.3:
+                noise = np.random.normal(0, 4, img.shape).astype(np.float32)
+                img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
         return img
     
@@ -445,8 +448,6 @@ class LISADetectionDataLoader:
             valid_data.append(item)
         
         print(f"  Valid samples: {len(valid_data)}")
-        # Cache validated dataset to speed up sampling for augmentations
-        self._valid_data = valid_data
         return valid_data
     
     def data_generator(self, data, batch_size, shuffle=True):
@@ -525,99 +526,256 @@ def classification_accuracy(y_true, y_pred):
     return tf.reduce_sum(correct) / (tf.reduce_sum(tf.cast(obj_mask, tf.float32)) + 1e-7)
 
 def create_detection_model(num_classes):
-    """Create lightweight detection model optimized for tiny objects"""
-    inputs = keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
+    """Create detection model with PROPERLY INITIALIZED separate heads"""
+    inputs = keras.Input(shape=(240, 320, 3))
     
     backbone = keras.applications.MobileNetV2(
-        input_shape=(IMG_HEIGHT, IMG_WIDTH, 3),
+        input_shape=(240, 320, 3),
         include_top=False,
         weights='imagenet',
         alpha=0.35
     )
     backbone.trainable = True
-    for layer in backbone.layers[:-30]:
+    for layer in backbone.layers[:-50]:
         layer.trainable = False
 
     x = backbone(inputs, training=False)
-
-    # Simpler head
-    reg = keras.regularizers.l2(5e-4)
     
-    x = layers.Conv2D(64, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
+    reg = keras.regularizers.l2(1e-4)  # Reduced from 5e-4
     
-    x = layers.Conv2D(48, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
-
     # Resize to grid
-    x = layers.Resizing(GRID_SIZE, GRID_SIZE, interpolation='bilinear')(x)
+    x = layers.Resizing(16, 16)(x)
     
-    # Final prediction head
-    x = layers.Conv2D(NUM_ANCHORS * (5 + num_classes), 1, padding='same')(x)
-    outputs = layers.Reshape((GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + num_classes))(x)
+    # Shared feature processing
+    x = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.2)(x)
+    
+    # CRITICAL: Separate processing paths BEFORE final heads
+    # Box/objectness branch
+    box_features = layers.Conv2D(64, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
+    box_features = layers.BatchNormalization()(box_features)
+    
+    # Classification branch (MORE capacity for harder task)
+    cls_features = layers.Conv2D(128, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
+    cls_features = layers.BatchNormalization()(cls_features)
+    cls_features = layers.Dropout(0.3)(cls_features)
+    cls_features = layers.Conv2D(64, 3, padding='same', activation='relu', kernel_regularizer=reg)(cls_features)
+    cls_features = layers.BatchNormalization()(cls_features)
+    
+    # Final prediction heads with PROPER initialization
+    box_head = layers.Conv2D(
+        4 * 5, 1, padding='same',
+        kernel_initializer=keras.initializers.RandomNormal(stddev=0.01),
+        bias_initializer='zeros'
+    )(box_features)
+    
+    cls_head = layers.Conv2D(
+        4 * num_classes, 1, padding='same',
+        kernel_initializer=keras.initializers.RandomNormal(stddev=0.01),
+        # CRITICAL: Initialize bias to favor uniform distribution
+        bias_initializer=keras.initializers.Constant(-np.log((num_classes - 1)))
+    )(cls_features)
+    
+    # Reshape and concatenate
+    box_out = layers.Reshape((16, 16, 4, 5))(box_head)
+    cls_out = layers.Reshape((16, 16, 4, num_classes))(cls_head)
+    outputs = layers.Concatenate(axis=-1)([box_out, cls_out])
 
     return keras.Model(inputs, outputs)
 
+# Funcion alternativa para la pérdida con focal loss y pesos ajustados    
 def detection_loss(y_true, y_pred):
+    """Fixed loss with proper gradient balancing"""
     epsilon = 1e-7
     
-    # FLATTEN class weights - extreme weights cause issues
-    class_weights = tf.constant([1.0, 1.0, 1.0, 1.0, 1.5, 2.0], dtype=tf.float32)
+    # Calculate BALANCED class weights
+    class_counts = np.array([307, 8, 264, 78, 18, 2])
+    total = class_counts.sum()
+    raw_weights = total / (len(class_counts) * class_counts + 1.0)
+    # Apply sqrt to reduce extreme values
+    raw_weights = np.sqrt(raw_weights)
+    # Normalize to mean=1
+    class_weights = tf.constant(raw_weights / raw_weights.mean(), dtype=tf.float32)
     
+    # Split predictions/ground truth
     obj_true = y_true[..., 0:1]
     box_true = y_true[..., 1:5]
     cls_true = y_true[..., 5:]
     
     obj_pred = tf.sigmoid(y_pred[..., 0:1])
-    cls_pred = tf.sigmoid(y_pred[..., 5:])
+    cls_pred_logits = y_pred[..., 5:]
+    cls_pred = tf.sigmoid(cls_pred_logits)
     
     tx_ty_pred = tf.sigmoid(y_pred[..., 1:3])
     tw_th_pred = y_pred[..., 3:5]
     box_pred = tf.concat([tx_ty_pred, tw_th_pred], axis=-1)
     
+    # Masks
     obj_mask = obj_true
     noobj_mask = 1 - obj_true
     
-    # Simple BCE for objectness
+    # 1. OBJECTNESS LOSS (balanced)
     obj_pred_clipped = tf.clip_by_value(obj_pred, epsilon, 1 - epsilon)
     obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + 
                 (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
-    
-    # MASSIVELY INCREASE positive objectness weight
-    obj_loss = obj_mask * obj_bce * 50.0  # Was 10.0 - CRITICAL
+    obj_loss = obj_mask * obj_bce * 5.0
     noobj_loss = noobj_mask * obj_bce * 0.5
     objectness_loss = tf.reduce_mean(obj_loss + noobj_loss)
     
-    # Box loss
+    # 2. BOX LOSS (unchanged)
     box_diff = box_true - box_pred
-    mse_loss = tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
-    size_diff = box_true[..., 2:4] - box_pred[..., 2:4]
-    size_penalty = tf.reduce_sum(tf.square(size_diff), axis=-1, keepdims=True) * 2.0
-    box_loss = obj_mask * (mse_loss + size_penalty)
+    box_loss = obj_mask * tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
     box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
     
-    # Classification loss
-    cls_pred_clipped = tf.clip_by_value(cls_pred, epsilon, 1 - epsilon)
-    cls_bce = -(cls_true * tf.math.log(cls_pred_clipped) + 
-                (1 - cls_true) * tf.math.log(1 - cls_pred_clipped))
-    weighted_cls_bce = cls_bce * tf.expand_dims(class_weights, axis=0)
-    cls_loss = obj_mask * tf.reduce_mean(weighted_cls_bce, axis=-1, keepdims=True)
+    # 3. CLASSIFICATION LOSS - CRITICAL FIX
+    # Use SOFTMAX cross-entropy instead of sigmoid BCE for multi-class
+    # This enforces mutual exclusivity between classes
+    
+    # Label smoothing
+    smoothing = 0.05  # Reduced from 0.1
+    cls_true_smooth = cls_true * (1 - smoothing) + smoothing / 6
+    
+    # Softmax cross-entropy (proper multi-class loss)
+    # Numerically stable version
+    logits_max = tf.reduce_max(cls_pred_logits, axis=-1, keepdims=True)
+    logits_stable = cls_pred_logits - logits_max
+    exp_logits = tf.exp(logits_stable)
+    sum_exp = tf.reduce_sum(exp_logits, axis=-1, keepdims=True)
+    log_probs = logits_stable - tf.math.log(sum_exp + epsilon)
+    
+    # Cross-entropy with label smoothing
+    cls_loss_raw = -tf.reduce_sum(cls_true_smooth * log_probs, axis=-1, keepdims=True)
+    
+    # Apply class weights
+    cls_true_idx = tf.argmax(cls_true, axis=-1)
+    weights_per_sample = tf.gather(class_weights, cls_true_idx)
+    weights_per_sample = tf.expand_dims(weights_per_sample, axis=-1)
+    
+    cls_loss = obj_mask * cls_loss_raw * weights_per_sample
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
     
-    # CRITICAL: Objectness must DOMINATE early training
-    total_loss = 3.0 * box_loss + 10.0 * objectness_loss + 1.0 * cls_loss
+    # 4. AUXILIARY LOSS: Encourage diversity in classification head
+    # Penalize if all predictions collapse to same class
+    cls_pred_mean = tf.reduce_mean(cls_pred, axis=[0, 1, 2])  # [num_classes]
+    # Want uniform distribution [1/6, 1/6, ..., 1/6]
+    target_dist = tf.ones_like(cls_pred_mean) / 6.0
+    diversity_loss = tf.reduce_mean(tf.square(cls_pred_mean - target_dist))
+    
+    # BALANCED total loss
+    total_loss = (3.0 * box_loss + 
+                  2.0 * objectness_loss + 
+                  3.0 * cls_loss +
+                  0.5 * diversity_loss) 
     
     return total_loss
 
+# Version estable de la funcion de perdida (no focal loss, necesita ajuste de pesos)
+# def detection_loss(y_true, y_pred):
+#     """Custom detection loss function combining objectness, bbox, and classification losses"""
+#     epsilon = 1e-7
+#     # Class weights SUAVIZADOS con raíz cuadrada
+#     raw_weights = np.array([
+#         1.0,   # go
+#         1.5,   # goLeft (era 2.0)
+#         1.0,   # stop  
+#         1.3,   # stopLeft (era 2.0)
+#         3.0,   # warning (era 8.0)
+#         4.0    # warningLeft (era 16.0)
+#     ])
+    
+#     # Suaviza con sqrt para reducir extremos
+#     class_weights = tf.constant(np.sqrt(raw_weights), dtype=tf.float32)
+#     # Resultado: [1.0, 4.11, 1.07, 1.57, 2.86, 4.81]
+    
+#     # Split predictions / ground truth
+#     obj_true = y_true[..., 0:1]
+#     box_true = y_true[..., 1:5]
+#     cls_true = y_true[..., 5:]
+
+#     # Predicted: apply sigmoid for objectness and class logits
+#     obj_pred = tf.sigmoid(y_pred[..., 0:1])
+#     cls_pred = tf.sigmoid(y_pred[..., 5:])
+
+#     # For box predictions: tx,ty should be sigmoided
+#     tx_ty_pred = tf.sigmoid(y_pred[..., 1:3])
+#     tw_th_pred = y_pred[..., 3:5]
+#     box_pred = tf.concat([tx_ty_pred, tw_th_pred], axis=-1)
+
+#     # Masks
+#     obj_mask = obj_true
+#     noobj_mask = 1 - obj_true
+
+#     # Objectness BCE
+#     obj_pred_clipped = tf.clip_by_value(obj_pred, epsilon, 1 - epsilon)
+#     obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
+    
+#     # Aumenta el peso de los positivos
+#     obj_loss = obj_mask * obj_bce * 5.0  # Peso extra para objectness positivo
+#     noobj_loss = noobj_mask * obj_bce * 0.5  # Reduce peso de negativos
+#     objectness_loss = tf.reduce_mean(obj_loss + noobj_loss)
+
+#     # Box regression (sin cambios)
+#     box_diff = box_true - box_pred
+#     box_loss = obj_mask * tf.reduce_sum(tf.square(box_diff), axis=-1, keepdims=True)
+#     box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
+
+#     # Classification BCE WITH WEIGHTS
+#     cls_pred_clipped = tf.clip_by_value(cls_pred, epsilon, 1 - epsilon)
+#     cls_bce = -(cls_true * tf.math.log(cls_pred_clipped) + 
+#                 (1 - cls_true) * tf.math.log(1 - cls_pred_clipped))
+    
+#     # Apply per-class weights
+#     weighted_cls_bce = cls_bce * tf.expand_dims(class_weights, axis=0)
+#     cls_loss = obj_mask * tf.reduce_mean(weighted_cls_bce, axis=-1, keepdims=True)
+#     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
+    
+#     # Aumenta peso de box loss por IoU bajo
+#     total_loss = 3.5 * box_loss + 2.0 * objectness_loss + 1.5 * cls_loss
+    
+#     return total_loss
+
+def get_classification_precision(y_true, y_pred):
+    """CORRECTED metric function - returns scalar, not dict"""
+    cls_true = y_true[..., 5:]
+    cls_pred = tf.sigmoid(y_pred[..., 5:])
+    obj_true = y_true[..., 0]
+    obj_pred = tf.sigmoid(y_pred[..., 0])
+    
+    cls_true_idx = tf.argmax(cls_true, axis=-1)
+    cls_pred_idx = tf.argmax(cls_pred, axis=-1)
+    obj_mask = tf.cast(obj_true > 0.5, tf.float32)
+    
+    correct = tf.cast(tf.equal(cls_true_idx, cls_pred_idx), tf.float32) * obj_mask
+    
+    # Precision: TP / (TP + FP)
+    pred_mask = tf.cast(obj_pred > 0.5, tf.float32)
+    tp = correct
+    fp = pred_mask * (1 - tf.cast(tf.equal(cls_true_idx, cls_pred_idx), tf.float32))
+    
+    precision = tf.reduce_sum(tp) / (tf.reduce_sum(tp + fp) + 1e-7)
+    return precision
+
 def train_model(model, train_data, val_data, train_loader, val_loader):
     """Train detection model using data generators"""
+
+    # Learning rate schedule with warmup
+    def lr_schedule(epoch):
+        if epoch < 3:  # Warmup
+            return 0.0002 * (epoch + 1) / 3
+        elif epoch < 15:
+            return 0.0002
+        elif epoch < 30:
+            return 0.0001
+        else:
+            return 0.00005
+
     
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE, weight_decay=1e-5),
+        # optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE, weight_decay=1e-5),
+        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
         loss=detection_loss,
-        metrics=[lambda y_t, y_p: classification_metrics(y_t, y_p)['cls_precision']]
+        metrics=[get_classification_precision]
     )
     
     # Calculate steps per epoch
@@ -661,140 +819,6 @@ def train_model(model, train_data, val_data, train_loader, val_loader):
     )
     
     return history
-
-
-# -------------------------
-# Knowledge Distillation
-# -------------------------
-try:
-    import tensorflow_model_optimization as tfmot
-except Exception:
-    tfmot = None
-
-
-def build_student_model(num_classes, alpha=STUDENT_ALPHA, head1=STUDENT_HEAD1, head2=STUDENT_HEAD2):
-    """Smaller student detection model"""
-    inputs = keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
-    backbone = keras.applications.MobileNetV2(
-        input_shape=(IMG_HEIGHT, IMG_WIDTH, 3),
-        include_top=False,
-        weights='imagenet',
-        alpha=alpha
-    )
-    backbone.trainable = False
-
-    x = backbone(inputs, training=False)
-    reg = keras.regularizers.l2(5e-4)
-    x = layers.Conv2D(head1, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
-    x = layers.Conv2D(head2, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
-
-    x = layers.Resizing(GRID_SIZE, GRID_SIZE)(x)
-    x = layers.Conv2D(NUM_ANCHORS * (5 + num_classes), 1, padding='same')(x)
-    outputs = layers.Reshape((GRID_SIZE, GRID_SIZE, NUM_ANCHORS, 5 + num_classes))(x)
-
-    return keras.Model(inputs, outputs)
-
-
-def distillation_train(teacher, student, train_data, val_data, loader,
-                       temperature=DISTILL_TEMPERATURE, alpha=DISTILL_ALPHA,
-                       epochs=10, batch_size=BATCH_SIZE):
-    """Custom distillation training loop for detection models.
-    Student learns from teacher predictions (soft targets) and ground-truth (hard targets).
-    """
-    optimizer = keras.optimizers.Adam(learning_rate=LEARNING_RATE)
-
-    # Create generators
-    train_gen = loader.data_generator(train_data, batch_size, shuffle=True)
-    steps_per_epoch = len(train_data) // batch_size
-    val_gen = loader.data_generator(val_data, batch_size, shuffle=False)
-    val_steps = len(val_data) // batch_size
-
-    # Metrics
-    train_loss_metric = keras.metrics.Mean(name='train_loss')
-    val_loss_metric = keras.metrics.Mean(name='val_loss')
-
-    kl = keras.losses.KLDivergence()
-
-    for epoch in range(epochs):
-        print(f"\n=== Distillation epoch {epoch+1}/{epochs} ===")
-        train_loss_metric.reset_state()
-
-        for step in range(steps_per_epoch):
-            imgs, y_true = next(train_gen)
-            # Teacher predictions (soft targets)
-            teacher_preds = teacher.predict_on_batch(imgs)
-
-            with tf.GradientTape() as tape:
-                student_preds = student(imgs, training=True)
-                # Hard loss (detection loss wrt GT)
-                hard_loss = detection_loss(y_true, student_preds)
-
-                # Soft loss: compute KL on class logits only (slice last channels [5:])
-                t = temperature
-                teacher_cls_logits = teacher_preds[..., 5:]
-                student_cls_logits = student_preds[..., 5:]
-                # apply softmax per-anchor over classes
-                teacher_soft = tf.nn.softmax(teacher_cls_logits / t, axis=-1)
-                student_soft = tf.nn.softmax(student_cls_logits / t, axis=-1)
-                # flatten anchors into vectors: shape [batch, -1, C]
-                teacher_flat = tf.reshape(teacher_soft, [-1, tf.shape(teacher_soft)[-1]])
-                student_flat = tf.reshape(student_soft, [-1, tf.shape(student_soft)[-1]])
-                soft_loss = tf.reduce_mean(kl(teacher_flat, student_flat)) * (t * t)
-
-                loss = alpha * hard_loss + (1.0 - alpha) * soft_loss
-
-            grads = tape.gradient(loss, student.trainable_variables)
-            optimizer.apply_gradients(zip(grads, student.trainable_variables))
-            train_loss_metric.update_state(loss)
-
-            if step % 50 == 0:
-                print(f"Step {step}/{steps_per_epoch} - loss: {train_loss_metric.result().numpy():.4f}")
-
-        # Validation loop (simple average loss)
-        val_loss_metric.reset_state()
-        for v in range(val_steps):
-            imgs_v, yv = next(val_gen)
-            sp = student.predict_on_batch(imgs_v)
-            lv = detection_loss(yv, sp)
-            val_loss_metric.update_state(lv)
-
-        print(f"Epoch {epoch+1}: train_loss={train_loss_metric.result().numpy():.4f}, val_loss={val_loss_metric.result().numpy():.4f}")
-
-    return student
-
-
-def apply_qat(student, train_data, loader, epochs=QAT_EPOCHS):
-    """Apply Quantization-Aware Training (QAT) to the student model using TF-MOT.
-    This requires `tensorflow_model_optimization` to be available.
-    """
-    if tfmot is None:
-        raise RuntimeError("tensorflow_model_optimization not available. Install it to use QAT.")
-
-    print("Applying quantization-aware training (QAT) wrapper to student model...")
-    # Add QAT wrapper
-    qat_model = tfmot.quantization.keras.quantize_model(student)
-
-    qat_model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE * 0.5),
-        loss=detection_loss,
-        metrics=[lambda y_t, y_p: classification_metrics(y_t, y_p)['cls_precision']]
-    )
-
-    train_gen = loader.data_generator(train_data, BATCH_SIZE, shuffle=True)
-    steps_per_epoch = len(train_data) // BATCH_SIZE
-
-    qat_model.fit(
-        train_gen,
-        steps_per_epoch=steps_per_epoch,
-        epochs=epochs,
-        verbose=1
-    )
-
-    return qat_model
 
 
 def decode_predictions(predictions, conf_threshold=CONF_THRESHOLD):
@@ -922,18 +946,17 @@ def convert_to_tflite(model, train_data, loader, output_path='traffic_light_dete
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative_dataset
     
-    # Enforce full integer quantization (signed int8) and export anchors
+    # Enforce full integer quantization
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    # Use signed int8 to match firmware int8 handling
-    converter.inference_input_type = tf.int8
-    converter.inference_output_type = tf.int8
-
-    print(f"Converting to INT8 (signed) quantized TFLite (using {num_calibration_samples} calibration samples)...")
+    converter.inference_input_type = tf.uint8
+    converter.inference_output_type = tf.uint8
+    
+    print(f"Converting to INT8 quantized TFLite (using {num_calibration_samples} calibration samples)...")
     tflite_model = converter.convert()
-
+    
     with open(output_path, 'wb') as f:
         f.write(tflite_model)
-
+    
     print(f"\nINT8 TFLite model saved: {output_path}")
     print(f"Model size: {len(tflite_model) / 1024:.2f} KB")
 
@@ -954,10 +977,10 @@ def convert_to_tflite(model, train_data, loader, output_path='traffic_light_dete
             print(f"Exported anchors header: {header_path}")
     except Exception as e:
         print("WARNING: Failed to export anchors header:", e)
-
+    
     return output_path
 
-def evaluate_map(results, class_names, iou_threshold=IOU_THRESHOLD_EVAL , img_width=IMG_WIDTH, img_height=IMG_HEIGHT, verbose=True, debug=False):
+def evaluate_map(results, class_names, iou_threshold=IOU_THRESHOLD_EVAL , img_width=IMG_WIDTH, img_height=IMG_HEIGHT, verbose=True):
     """
     Compute mAP with DETAILED debugging to understand why mAP is low
     """
@@ -1017,37 +1040,10 @@ def evaluate_map(results, class_names, iou_threshold=IOU_THRESHOLD_EVAL , img_wi
         pred_boxes = result['boxes']
         total_predictions += len(pred_boxes)
         
-        # Debugging: compute confidence and area stats, anchors info
-        if debug or (verbose and result_idx < 5):
-            confs = np.array([b[4] for b in pred_boxes]) if pred_boxes else np.array([])
-            areas = np.array([(b[2]-b[0])*(b[3]-b[1]) for b in pred_boxes]) if pred_boxes else np.array([])
+        if verbose and result_idx < 5:  # Show first 5 images in detail
             print(f"\n--- Image {result_idx + 1}: {result.get('filename', 'unknown')} ---")
             print(f"GT boxes: {len(scaled_gts)}, Predictions: {len(pred_boxes)}")
             print(f"Original size: {orig_w}x{orig_h}, Model size: {img_width}x{img_height}")
-            if pred_boxes:
-                try:
-                    print(f"  conf: min={confs.min():.4f} mean={confs.mean():.4f} max={confs.max():.4f} counts>0.05:{(confs>0.05).sum()} >0.25:{(confs>0.25).sum()}")
-                    print(f"  area: min={areas.min():.1f} mean={areas.mean():.1f} max={areas.max():.1f} (pixels)")
-                except Exception:
-                    print("  (could not compute conf/area stats)")
-                x1s = np.array([b[0] for b in pred_boxes])
-                y1s = np.array([b[1] for b in pred_boxes])
-                x2s = np.array([b[2] for b in pred_boxes])
-                y2s = np.array([b[3] for b in pred_boxes])
-                oob_x = np.sum((x1s<0) | (x2s>img_width))
-                oob_y = np.sum((y1s<0) | (y2s>img_height))
-                print(f"  out_of_bounds: x={oob_x}, y={oob_y}")
-                print("  sample preds:", pred_boxes[:5])
-            else:
-                print("  ⚠️ NO PREDICTIONS for this image")
-            # Print anchors if available
-            try:
-                if ANCHORS is not None:
-                    print(f"  Anchors (fractions): {ANCHORS}")
-                    anchors_px = np.array(ANCHORS) * np.array([img_width, img_height])
-                    print(f"  Anchors (px): {anchors_px.astype(int).tolist()}")
-            except Exception as e:
-                print("  (Could not print anchors):", e)
         
         if len(pred_boxes) == 0:
             failure_reasons['no_predictions'] += len(scaled_gts)
@@ -1399,86 +1395,7 @@ def debug_predictions_detailed(model, test_data, loader, num_samples=3):
             y2_scaled = int(gt['y2'] * IMG_HEIGHT / item['orig_h'])
             size = f"{x2_scaled-x1_scaled}x{y2_scaled-y1_scaled}"
             print(f"    {gt['class']}: {size} píxeles")
-def random_scale_and_crop(img, out_h, out_w, scale_min=0.9, scale_max=1.15, p=0.6):
-    if random.random() > p:
-        return cv2.resize(img, (out_w, out_h))
-    scale = np.random.uniform(scale_min, scale_max)
-    h, w = img.shape[:2]
-    img_s = cv2.resize(img, (max(1, int(w*scale)), max(1, int(h*scale))))
-    ch, cw = img_s.shape[:2]
-    # center-crop
-    start_x = max(0, (cw - out_w)//2)
-    start_y = max(0, (ch - out_h)//2)
-    crop = img_s[start_y:start_y+out_h, start_x:start_x+out_w]
-    if crop.shape[0] != out_h or crop.shape[1] != out_w:
-        crop = cv2.resize(img, (out_w, out_h))
-    return crop
-def copy_paste_augment(img, boxes, loader, max_pastes=2, prob=0.4, max_scale=0.5):
-    # boxes = list of dicts with x1,y1,x2,y2,class
-    if random.random() > prob:
-        return img, boxes
-    # pick random other sample (use cached valid dataset if available to avoid recomputing anchors)
-    if getattr(loader, '_valid_data', None) is None:
-        # Build a cached valid dataset without augmentation (done once)
-        loader._valid_data = loader.create_dataset(loader.load_dataset(), apply_calibration=False)
-    sample = random.choice(loader._valid_data)
-    src_img = cv2.imread(sample['img_path'])
-    if src_img is None: return img, boxes
-    src_img = cv2.cvtColor(src_img, cv2.COLOR_BGR2RGB)
-    # pick a random GT box in src
-    if not sample['boxes']: return img, boxes
-    sbox = random.choice(sample['boxes'])
-    x1,y1,x2,y2 = sbox['x1'], sbox['y1'], sbox['x2'], sbox['y2']
-    patch = src_img[y1:y2, x1:x2]
-    # scale patch to small area relative to target
-    h, w = img.shape[:2]
 
-    # Guard against invalid patch
-    if patch is None or patch.size == 0 or patch.shape[0] == 0 or patch.shape[1] == 0:
-        return img, boxes
-
-    scale_factor = random.uniform(0.03, max_scale)  # target area fraction
-    target_w = max(4, int(w * scale_factor))
-    # Keep aspect ratio of the patch
-    aspect = float(patch.shape[0]) / (patch.shape[1] + 1e-6)
-    target_h = max(4, int(h * scale_factor * aspect))
-
-    # Ensure target fits inside the image; if too large, scale down preserving aspect
-    if target_w > w or target_h > h:
-        scale_down = min(w / target_w, h / target_h)
-        target_w = max(4, int(target_w * scale_down))
-        target_h = max(4, int(target_h * scale_down))
-
-    # Resize patch safely
-    patch = cv2.resize(patch, (target_w, target_h))
-
-    # paste at random location (safe: ensure px+target_w <= w and py+target_h <= h)
-    max_x = max(0, w - target_w)
-    max_y = max(0, h - target_h)
-    px = random.randint(0, max_x)
-    py = random.randint(0, max_y)
-
-    img_copy = img.copy()
-    img_copy[py:py+target_h, px:px+target_w] = patch
-
-    # optionally append box (in image coords)
-    new_box = {'x1': px, 'y1': py, 'x2': px+target_w, 'y2': py+target_h, 'class': sbox['class']}
-    boxes = boxes + [new_box]
-    return img_copy, boxes
-def photometric(img):
-    # brightness
-    if random.random() < 0.5:
-        f = 1.0 + np.random.uniform(-0.18, 0.18)
-        img = np.clip(img.astype(np.float32) * f, 0, 255).astype(np.uint8)
-    # contrast
-    if random.random() < 0.5:
-        alpha = 1.0 + np.random.uniform(-0.15, 0.15)
-        img = np.clip(127 + alpha * (img - 127), 0, 255).astype(np.uint8)
-    # small gaussian noise
-    if random.random() < 0.4:
-        noise = np.random.normal(0, 3, img.shape).astype(np.float32)
-        img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    return img
 def main():
     """Main training pipeline - FIXED VERSION"""
     print("="*80)
@@ -1580,53 +1497,17 @@ def main():
         keras_test_results.append({
             'filename': item['filename'],
             'boxes': boxes,
-            'ground_truth_count': len(item['boxes']),
-            'predicted_count': len(boxes),
             'gt_boxes': item['boxes'],
-            'image': img,
             'orig_w': item['orig_w'],
             'orig_h': item['orig_h']
         })
     
     keras_aps, keras_map = evaluate_map(keras_test_results, loader.class_names, verbose=True)
-    if keras_map == 0.0:
-        print("\nNo mAP detected for Keras model — re-running evaluation with debug=True for diagnostics")
-        evaluate_map(keras_test_results, loader.class_names, verbose=True, debug=True)
     
     # Then test TFLite model
     print("\n--- Testing TFLite Model on Test Set ---")
     tflite_test_results = test_tflite_model(tflite_path, test_items, loader.class_names, num_samples=30)
     tflite_aps, tflite_map = evaluate_map(tflite_test_results, loader.class_names, verbose=True)
-    if tflite_map == 0.0:
-        print("\nNo mAP detected for TFLite model — re-running evaluation with debug=True for diagnostics")
-        evaluate_map(tflite_test_results, loader.class_names, verbose=True, debug=True)
-
-    # Optionally perform distillation -> student -> QAT flow
-    student_model = None
-    if DO_DISTILL:
-        print("\n=== Starting distillation (teacher -> student) ===")
-        # Build student
-        student_model = build_student_model(num_classes=loader.num_classes)
-        student_model.summary()
-        # Distillation training
-        student_model = distillation_train(model, student_model, train_items, val_items, loader,
-                                           temperature=DISTILL_TEMPERATURE, alpha=DISTILL_ALPHA,
-                                           epochs=10, batch_size=BATCH_SIZE)
-
-        # Optional QAT
-        if DO_QAT:
-            print("\n=== Applying QAT to student model ===")
-            if tfmot is None:
-                print("⚠ tensorflow_model_optimization not installed; skipping QAT")
-            else:
-                student_model = apply_qat(student_model, train_items, loader, epochs=QAT_EPOCHS)
-
-        # Convert the student model to TFLite
-        student_tflite_path = convert_to_tflite(student_model, train_items, loader, output_path='traffic_light_detector_student.tflite')
-        print("\n--- Testing STUDENT TFLite Model on Test Set ---")
-        student_test_results = test_tflite_model(student_tflite_path, test_items, loader.class_names, num_samples=30)
-        student_aps, student_map = evaluate_map(student_test_results, loader.class_names, verbose=True)
-        print(f"Student TFLite mAP: {student_map:.3f}")
 
     # Visualize
     visualize_detections(keras_test_results, num_display=6)

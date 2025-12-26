@@ -1,0 +1,155 @@
+LISA Traffic Light Dataset
+├── Annotations
+│   └── Annotations
+│       ├── daySequence1
+│       │   ├── frameAnnotationsBOX.csv
+│       │   └── frameAnnotationsBULB.csv
+│       ├── daySequence2
+│       │   ├── frameAnnotationsBOX.csv
+│       │   └── frameAnnotationsBULB.csv
+│       ├── dayTrain
+│       │   ├── dayClip1
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip2
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip3
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip4
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip5
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip6
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip7
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip8
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip9
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip10
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip11
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   ├── dayClip12
+│       │   │   ├── frameAnnotationsBOX.csv
+│       │   │   └── frameAnnotationsBULB.csv
+│       │   └── dayClip13
+│       │       ├── frameAnnotationsBOX.csv
+│       │       └── frameAnnotationsBULB.csv
+│       ├── nightSequence1
+│       │   ├── frameAnnotationsBOX.csv
+│       │   └── frameAnnotationsBULB.csv
+│       ├── nightSequence2
+│       │   ├── frameAnnotationsBOX.csv
+│       │   └── frameAnnotationsBULB.csv
+│       └── nightTrain
+│           ├── nightClip1
+│           │   ├── frameAnnotationsBOX.csv
+│           │   └── frameAnnotationsBULB.csv
+│           ├── nightClip2
+│           │   ├── frameAnnotationsBOX.csv
+│           │   └── frameAnnotationsBULB.csv
+│           ├── nightClip3
+│           │   ├── frameAnnotationsBOX.csv
+│           │   └── frameAnnotationsBULB.csv
+│           ├── nightClip4
+│           │   ├── frameAnnotationsBOX.csv
+│           │   └── frameAnnotationsBULB.csv
+│           └── nightClip5
+│               ├── frameAnnotationsBOX.csv
+│               └── frameAnnotationsBULB.csv
+├── daySequence1
+│   └── daySequence1
+│       ├── .DS_Store
+│       └── frames
+├── daySequence2
+│   └── daySequence2
+│       ├── .DS_Store
+│       └── frames
+├── dayTrain
+│   └── dayTrain
+│       ├── .DS_Store
+│       ├── dayClip1
+│       │   └── frames
+│       ├── dayClip2
+│       │   └── frames
+│       ├── dayClip3
+│       │   └── frames
+│       ├── dayClip4
+│       │   └── frames
+│       ├── dayClip5
+│       │   └── frames
+│       ├── dayClip6
+│       │   └── frames
+│       ├── dayClip7
+│       │   └── frames
+│       ├── dayClip8
+│       │   └── frames
+│       ├── dayClip9
+│       │   └── frames
+│       ├── dayClip10
+│       │   └── frames
+│       ├── dayClip11
+│       │   └── frames
+│       ├── dayClip12
+│       │   └── frames
+│       └── dayClip13
+│           └── frames
+├── nightSequence1
+│   └── nightSequence1
+│       ├── .DS_Store
+│       └── frames
+├── nightSequence2
+│   └── nightSequence2
+│       ├── .DS_Store
+│       └── frames
+├── nightTrain
+│   └── nightTrain
+│       ├── .DS_Store
+│       ├── nightClip1
+│       │   └── frames
+│       ├── nightClip2
+│       │   └── frames
+│       ├── nightClip3
+│       │   └── frames
+│       ├── nightClip4
+│       │   └── frames
+│       ├── nightClip5
+│       │   └── frames
+│       ├── nightClip6
+│       │   └── frames
+│       ├── nightClip7
+│       │   └── frames
+│       ├── nightClip8
+│       │   └── frames
+│       ├── nightClip9
+│       │   └── frames
+│       ├── nightClip10
+│       │   └── frames
+│       ├── nightClip11
+│       │   └── frames
+│       ├── nightClip12
+│       │   └── frames
+│       └── nightClip13
+│           └── frames
+├── sample-dayClip6
+│   └── sample-dayClip6
+│       ├── frames
+│       ├── frameAnnotationsBOX.csv
+│       └── frameAnnotationsBULB.csv
+└── sample-nightClip1
+    └── sample-nightClip1
+        ├── frames
+        ├── frameAnnotationsBOX.csv
+        └── frameAnnotationsBULB.csv
