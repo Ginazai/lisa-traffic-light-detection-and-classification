@@ -35,7 +35,7 @@ LEARNING_RATE = 0.0002
 IOU_THRESHOLD_EVAL = 0.25 
 IOU_THRESHOLD_NMS = 0.2   # aggresive NMS 
 CONF_THRESHOLD = 0.5 # 0.75 reduced for testing
-MAX_SAMPLES = 36775 # Total Lisa Traffic Light Dataset samples (36775 total)
+MAX_SAMPLES = 43016 # Total Lisa Traffic Light Dataset samples (43016 total)
 
 # Dataset paths
 DATASET_ROOT = "LISA Traffic Light Dataset"
@@ -431,7 +431,7 @@ class LISADetectionDataLoader:
         
         return target
     
-    def preprocess_image(self, img_path, apply_calibration=True):
+    def preprocess_image(self, img_path, apply_calibration=False):
         """Load and preprocess full image"""
         img = cv2.imread(img_path)
         
@@ -468,7 +468,7 @@ class LISADetectionDataLoader:
 
         return img
     
-    def create_dataset(self, data, apply_calibration=True):
+    def create_dataset(self, data, apply_calibration=False):
         """Create dataset metadata (paths only, not loaded into memory)"""
         valid_data = []
         
@@ -646,16 +646,33 @@ def detection_loss(y_true, y_pred):
     """
     epsilon = 1e-7
     
-    # PESOS CORREGIDOS
-    class_weights = tf.constant([
-        1.00,  # go          (13000 samples, 44.7%)
-        2.27,  # goLeft      (2500 samples, 8.6%)
-        1.09,  # stop        (11000 samples, 37.8%)
-        2.55,  # stopLeft    (2000 samples, 6.9%)
-        5.10,  # warning     (500 samples, 1.7%)
-        11.40  # warningLeft (100 samples, 0.3%)
-    ], dtype=tf.float32)
+    # ============================================
+    # CLASS WEIGHTS: Dinámicos basados en DATASET COMPLETO
+    # ============================================
+    # CRITICAL: Usa conteos del dataset COMPLETO, no del split
+    # Estos son los conteos reales de LISA según DatasetNinja
+    class_counts = np.array([93960, 4966, 88892, 25484, 5419, 701])
     
+    total = class_counts.sum()
+    
+    # Inverse frequency
+    raw_weights = total / (len(class_counts) * class_counts + 1.0)
+    
+    # Sqrt smoothing (CRITICAL para evitar extremos)
+    raw_weights = np.sqrt(raw_weights)
+    
+    # Extra smoothing: clip máximo a 3x el mínimo
+    # Esto evita que warningLeft domine completamente
+    min_weight = raw_weights.min()
+    max_allowed = min_weight * 3.0
+    raw_weights = np.clip(raw_weights, min_weight, max_allowed)
+    
+    # Normalize to mean=1
+    class_weights = tf.constant(raw_weights / raw_weights.mean(), dtype=tf.float32)
+    
+    # ============================================
+    # PARSE TENSORS
+    # ============================================
     obj_true = y_true[..., 0:1]
     box_true = y_true[..., 1:5]
     cls_true = y_true[..., 5:]
@@ -670,34 +687,52 @@ def detection_loss(y_true, y_pred):
     obj_mask = obj_true
     noobj_mask = 1 - obj_true
     
-    # Objectness
+    # ============================================
+    # 1. OBJECTNESS LOSS - Con Focal Loss
+    # ============================================
     obj_pred_clipped = tf.clip_by_value(obj_pred, epsilon, 1 - epsilon)
     obj_bce = -(obj_true * tf.math.log(obj_pred_clipped) + 
                 (1 - obj_true) * tf.math.log(1 - obj_pred_clipped))
     
+    # Focal loss (reduce peso de ejemplos fáciles)
     gamma_obj = 2.0
     pt_obj = tf.where(obj_true > 0.5, obj_pred, 1 - obj_pred)
     focal_weight_obj = tf.pow(1 - pt_obj, gamma_obj)
     
-    obj_loss = obj_mask * obj_bce * focal_weight_obj * 6.0
+    # Balanceo pos/neg
+    obj_loss = obj_mask * obj_bce * focal_weight_obj * 5.0
     noobj_loss = noobj_mask * obj_bce * focal_weight_obj * 0.5
     objectness_loss = tf.reduce_mean(obj_loss + noobj_loss)
     
-    # Box regression (Smooth L1)
+    # ============================================
+    # 2. BOX REGRESSION - Smooth L1 (mejor que MSE)
+    # ============================================
     position_diff = box_true[..., :2] - box_pred[..., :2]
     size_diff = box_true[..., 2:] - box_pred[..., 2:]
     
     def smooth_l1(diff):
         abs_diff = tf.abs(diff)
-        return tf.where(abs_diff < 1.0, 0.5 * tf.square(diff), abs_diff - 0.5)
+        return tf.where(
+            abs_diff < 1.0,
+            0.5 * tf.square(diff),
+            abs_diff - 0.5
+        )
     
     position_loss = tf.reduce_sum(smooth_l1(position_diff), axis=-1, keepdims=True)
     size_loss = tf.reduce_sum(smooth_l1(size_diff), axis=-1, keepdims=True)
     
+    # Peso extra a posición (tu problema principal)
     box_loss = obj_mask * (3.0 * position_loss + 1.0 * size_loss)
     box_loss = tf.reduce_sum(box_loss) / (tf.reduce_sum(obj_mask) + epsilon)
     
-    # Classification
+    # ============================================
+    # 3. CLASSIFICATION - Focal Loss + Label Smoothing
+    # ============================================
+    # Label smoothing (del código 0.41)
+    smoothing = 0.05
+    cls_true_smooth = cls_true * (1 - smoothing) + smoothing / 6.0
+    
+    # Softmax (numerically stable)
     logits_max = tf.reduce_max(cls_pred_logits, axis=-1, keepdims=True)
     logits_stable = cls_pred_logits - logits_max
     exp_logits = tf.exp(logits_stable)
@@ -706,40 +741,63 @@ def detection_loss(y_true, y_pred):
     probs = exp_logits / (sum_exp + epsilon)
     log_probs = logits_stable - tf.math.log(sum_exp + epsilon)
     
+    # Focal loss
     gamma_cls = 2.0
     pt_cls = tf.reduce_sum(cls_true * probs, axis=-1, keepdims=True)
     focal_weight_cls = tf.pow(1 - pt_cls, gamma_cls)
     
-    cls_ce_per_class = -cls_true * log_probs
+    # Cross-entropy con class weights
+    cls_ce_per_class = -cls_true_smooth * log_probs
     weighted_ce = cls_ce_per_class * tf.reshape(class_weights, [1, 1, 1, 1, -1])
     
     cls_loss_raw = tf.reduce_sum(weighted_ce, axis=-1, keepdims=True)
     cls_loss = obj_mask * cls_loss_raw * focal_weight_cls
     cls_loss = tf.reduce_sum(cls_loss) / (tf.reduce_sum(obj_mask) + epsilon)
     
-    # Class-aware objectness
+    # ============================================
+    # 4. DIVERSITY LOSS (del código 0.41)
+    # ============================================
+    # Evita que todas las predicciones colapsen a una clase
+    cls_pred_mean = tf.reduce_mean(probs, axis=[0, 1, 2])
+    target_dist = tf.ones_like(cls_pred_mean) / 6.0
+    diversity_loss = tf.reduce_mean(tf.square(cls_pred_mean - target_dist))
+    
+    # ============================================
+    # 5. CLASS-AWARE OBJECTNESS PENALTY
+    # ============================================
+    # Penaliza alta confianza con clasificación incorrecta
     cls_pred_idx = tf.argmax(probs, axis=-1)
     cls_true_idx = tf.argmax(cls_true, axis=-1)
     class_mismatch = tf.cast(tf.not_equal(cls_pred_idx, cls_true_idx), tf.float32)
     class_mismatch = tf.expand_dims(class_mismatch, axis=-1)
     
     cls_confidence = tf.reduce_max(probs, axis=-1, keepdims=True)
-    confident_wrong = class_mismatch * tf.cast(cls_confidence > 0.5, tf.float32)
+    confident_wrong = class_mismatch * tf.cast(cls_confidence > 0.6, tf.float32)
     
     class_obj_penalty = obj_pred * confident_wrong * obj_mask
     class_obj_loss = tf.reduce_mean(class_obj_penalty)
     
-    # Background suppression
+    # ============================================
+    # 6. BACKGROUND SUPPRESSION
+    # ============================================
+    # Penaliza alta confianza en celdas sin objetos
     high_conf_background = noobj_mask * obj_pred * tf.cast(obj_pred > 0.5, tf.float32)
     background_penalty = tf.reduce_mean(high_conf_background)
     
-    # TOTAL LOSS (balanceado)
+    # ============================================
+    # TOTAL LOSS - BALANCEADO CUIDADOSAMENTE
+    # ============================================
+    # Pesos ajustados para evitar colapso:
+    # - box_loss reducido de 10.0 → 6.0
+    # - cls_loss reducido de 5.0 → 4.0
+    # - Mantiene diversity_loss del código 0.41
     total_loss = (
-        8.0 * box_loss +
-        3.0 * objectness_loss +
-        8.0 * cls_loss +
-        1.0 * class_obj_loss +
-        0.5 * background_penalty
+        6.0 * box_loss +           # Localización (reducido para estabilidad)
+        2.0 * objectness_loss +     # Detección
+        4.0 * cls_loss +            # Clasificación (reducido)
+        0.5 * diversity_loss +      # Del código 0.41
+        1.0 * class_obj_loss +      # Consistencia (reducido de 2.0)
+        0.3 * background_penalty    # Limpieza
     )
     
     return total_loss
@@ -1651,7 +1709,7 @@ def main():
     print("\n[2/6] Creating train/val/test split from ALL data...")
     
     # First, create dataset metadata (validate images exist)
-    all_items = loader.create_dataset(all_data, apply_calibration=True)
+    all_items = loader.create_dataset(all_data, apply_calibration=False)
     print(f"Valid samples: {len(all_items)}")
     
     # Split: 70% train, 15% val, 15% test
@@ -1677,13 +1735,13 @@ def main():
     for item in val_items + test_items:
         item['apply_calibration'] = False
     
-    print(f"\n✅ Dataset split complete:")
+    print(f"\nDataset split complete:")
     print(f"  Train: {len(train_items)} ({100*len(train_items)/len(all_items):.1f}%)")
     print(f"  Val:   {len(val_items)} ({100*len(val_items)/len(all_items):.1f}%)")
     print(f"  Test:  {len(test_items)} ({100*len(test_items)/len(all_items):.1f}%)")
     
     # Verify the split includes all sequences
-    print("\n📊 Checking data distribution:")
+    print("\nChecking data distribution:")
     for split_name, split_data in [("Train", train_items), ("Val", val_items), ("Test", test_items)]:
         sources = {}
         for item in split_data:
@@ -1733,7 +1791,8 @@ def main():
             'boxes': boxes,
             'gt_boxes': item['boxes'],
             'orig_w': item['orig_w'],
-            'orig_h': item['orig_h']
+            'orig_h': item['orig_h'],
+            'image': item['img_path']
         })
     
     keras_aps, keras_map = evaluate_map(keras_test_results, loader.class_names, verbose=True)
