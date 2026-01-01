@@ -1,0 +1,227 @@
+Epoch 1/30
+1813/1813 ━━━━━━━━━━━━━━━━━━━━ 0s 2s/step - lambda: 0.2077 - loss: 4.0320
+Epoch 1: val_loss improved from None to 1.18977, saving model to best_detection_model.h5
+WARNING:absl:You are saving your model as an HDF5 file via `model.save()` or `keras.saving.save_model(model)`. This file format is considered legacy. We recommend using instead the native Keras format, e.g. `model.save('my_model.keras')` or `keras.saving.save_model(model, 'my_model.keras')`.
+
+================================================================================
+mAP EVALUATION DEBUG (IoU threshold = 0.25)
+================================================================================
+
+--- Image 1: dayClip2--00710.jpg ---
+GT boxes: 1, Predictions: 1
+Original size: 1280x960, Model size: 800x600
+  Pred 0: go @ (549,122,559,134) conf=0.968
+    ❌ WRONG CLASS - no GT of class 'go' in image
+  GT: go @ (535,117,543,125) size=8x8
+    ❌ UNMATCHED (False Negative)
+
+--- Image 2: nightClip1--00341.jpg ---
+GT boxes: 3, Predictions: 1
+Original size: 1280x960, Model size: 800x600
+  Pred 0: stop @ (238,410,248,420) conf=0.209
+    ❌ WRONG CLASS - no GT of class 'stop' in image
+  GT: go @ (424,190,428,196) size=4x6
+    ❌ UNMATCHED (False Negative)
+  GT: go @ (467,191,471,195) size=4x4
+    ❌ UNMATCHED (False Negative)
+  GT: go @ (273,210,277,216) size=4x6
+    ❌ UNMATCHED (False Negative)
+
+--- Image 3: nightClip4--00138.jpg ---
+GT boxes: 4, Predictions: 0
+Original size: 1280x960, Model size: 800x600
+  ⚠️ NO PREDICTIONS for this image
+
+--- Image 4: nightClip4--00489.jpg ---
+GT boxes: 2, Predictions: 2
+Original size: 1280x960, Model size: 800x600
+  Pred 0: go @ (405,79,420,94) conf=0.851
+    ❌ WRONG CLASS - no GT of class 'go' in image
+  Pred 1: stop @ (667,169,682,187) conf=0.745
+    ❌ WRONG CLASS - no GT of class 'stop' in image
+  GT: go @ (396,60,413,75) size=17x15
+    ❌ UNMATCHED (False Negative)
+  GT: go @ (648,162,662,178) size=14x16
+    ❌ UNMATCHED (False Negative)
+
+--- Image 5: dayClip5--00808.jpg ---
+GT boxes: 3, Predictions: 5
+Original size: 1280x960, Model size: 800x600
+  Pred 0: stop @ (715,120,723,131) conf=0.994
+    ✅ MATCH! IoU = 0.400
+  Pred 1: stop @ (584,90,595,102) conf=0.990
+    ✅ MATCH! IoU = 0.846
+  Pred 2: stopLeft @ (474,83,486,95) conf=0.949
+    ❌ WRONG CLASS - no GT of class 'stopLeft' in image
+  GT: stopLeft @ (460,85,473,97) size=13x12
+    ❌ UNMATCHED (False Negative)
+
+================================================================================
+SUMMARY
+================================================================================
+
+Total GT boxes: 575
+Total Predictions: 473
+Successful Matches: 94 (16.3% recall)
+
+Failure breakdown:
+  no_predictions: 106 (18.4%)
+  wrong_class: 260 (45.2%)
+  low_iou: 110 (19.1%)
+  already_matched: 9 (1.6%)
+
+Per-class statistics:
+Class           GT     Pred   TP     FP     FN     Precision  Recall     AP
+-------------------------------------------------------------------------------------
+go              243    142    33     109    210    0.232      0.136      0.032
+goLeft          18     4      0      4      18     0.000      0.000      0.000
+stop            199    243    61     182    138    0.251      0.307      0.077
+stopLeft        91     84     0      84     91     0.000      0.000      0.000
+warning         23     0      0      0      23     0.000      0.000      0.000
+warningLeft     1      0      0      0      1      0.000      0.000      0.000
+
+IoU distribution (all pred-GT pairs of same class):
+  Mean: 0.067
+  Median: 0.000
+  <0.3: 90.8%
+  0.3-0.5: 4.6%
+  >=0.5: 4.5%
+
+================================================================================
+FINAL mAP @ IoU=0.25: 0.018
+================================================================================
+
+
+Epoch 1: val_mAP=0.018
+Visualization saved: detection_results-20251219-221705.png
+Epoch 1: detection preview saved
+1813/1813 ━━━━━━━━━━━━━━━━━━━━ 3066s 2s/step - lambda: 0.3207 - loss: 2.1620 - val_lambda: 0.5798 - val_loss: 1.1898 - learning_rate: 0.0010 - val_mAP: 0.0181
+Epoch 2/30
+1813/1813 ━━━━━━━━━━━━━━━━━━━━ 0s 2s/step - lambda: 0.4275 - loss: 0.9375
+Epoch 2: val_loss improved from 1.18977 to 1.07004, saving model to best_detection_model.h5
+WARNING:absl:You are saving your model as an HDF5 file via `model.save()` or `keras.saving.save_model(model)`. This file format is considered legacy. We recommend using instead the native Keras format, e.g. `model.save('my_model.keras')` or `keras.saving.save_model(model, 'my_model.keras')`.
+
+================================================================================
+mAP EVALUATION DEBUG (IoU threshold = 0.25)
+================================================================================
+
+--- Image 1: dayClip5--01849.jpg ---
+GT boxes: 3, Predictions: 4
+Original size: 1280x960, Model size: 800x600
+  Pred 0: go @ (576,105,586,116) conf=0.973
+    ❌ LOW IoU = 0.019 < 0.25
+       GT: (584,114,594,125) size=10x11
+       Pred size=10x11
+  Pred 1: go @ (426,242,429,246) conf=0.957
+    ❌ WRONG CLASS - no GT of class 'go' in image
+  Pred 2: stopLeft @ (462,81,475,93) conf=0.925
+    ✅ MATCH! IoU = 0.393
+  GT: go @ (584,114,594,125) size=10x11
+    ❌ UNMATCHED (False Negative)
+
+--- Image 2: dayClip7--02157.jpg ---
+GT boxes: 3, Predictions: 4
+Original size: 1280x960, Model size: 800x600
+  Pred 0: stopLeft @ (452,98,464,108) conf=0.986
+    ❌ LOW IoU = 0.101 < 0.25
+       GT: (453,106,465,116) size=12x10
+       Pred size=12x10
+  Pred 1: go @ (686,164,695,174) conf=0.949
+    ❌ LOW IoU = 0.103 < 0.25
+       GT: (693,166,702,175) size=9x9
+       Pred size=9x10
+  Pred 2: go @ (565,135,572,142) conf=0.841
+    ❌ LOW IoU = 0.119 < 0.25
+       GT: (569,138,577,146) size=8x8
+       Pred size=7x7
+  GT: go @ (569,138,577,146) size=8x8
+    ❌ UNMATCHED (False Negative)
+  GT: go @ (693,166,702,175) size=9x9
+    ❌ UNMATCHED (False Negative)
+  GT: stopLeft @ (453,106,465,116) size=12x10
+    ❌ UNMATCHED (False Negative)
+
+--- Image 3: nightClip3--00199.jpg ---
+GT boxes: 1, Predictions: 5
+Original size: 1280x960, Model size: 800x600
+  Pred 0: go @ (275,216,278,219) conf=0.954
+    ❌ WRONG CLASS - no GT of class 'go' in image
+  Pred 1: go @ (337,209,340,212) conf=0.931
+    ❌ WRONG CLASS - no GT of class 'go' in image
+  Pred 2: go @ (274,199,279,204) conf=0.895
+    ❌ WRONG CLASS - no GT of class 'go' in image
+  GT: go @ (284,211,292,218) size=8x7
+    ❌ UNMATCHED (False Negative)
+
+--- Image 4: dayClip8--00114.jpg ---
+GT boxes: 2, Predictions: 3
+Original size: 1280x960, Model size: 800x600
+  Pred 0: stop @ (527,122,533,128) conf=0.913
+    ❌ LOW IoU = 0.200 < 0.25
+       GT: (521,120,530,128) size=9x8
+       Pred size=6x6
+  Pred 1: stop @ (373,111,384,121) conf=0.911
+    ❌ WRONG CLASS - no GT of class 'stop' in image
+  Pred 2: stop @ (474,109,486,119) conf=0.826
+    ❌ WRONG CLASS - no GT of class 'stop' in image
+  GT: stop @ (521,120,530,128) size=9x8
+    ❌ UNMATCHED (False Negative)
+  GT: stopLeft @ (372,123,381,131) size=9x8
+    ❌ UNMATCHED (False Negative)
+
+--- Image 5: nightClip4--00632.jpg ---
+GT boxes: 3, Predictions: 4
+Original size: 1280x960, Model size: 800x600
+  Pred 0: stop @ (479,173,489,183) conf=0.945
+    ❌ WRONG CLASS - no GT of class 'stop' in image
+  Pred 1: stop @ (528,175,538,186) conf=0.932
+    ❌ WRONG CLASS - no GT of class 'stop' in image
+  Pred 2: stop @ (180,150,194,163) conf=0.845
+    ❌ WRONG CLASS - no GT of class 'stop' in image
+  GT: stop @ (346,203,350,208) size=4x5
+    ❌ UNMATCHED (False Negative)
+  GT: stop @ (461,181,467,187) size=6x6
+    ❌ UNMATCHED (False Negative)
+  GT: stop @ (522,205,529,213) size=7x8
+    ❌ UNMATCHED (False Negative)
+
+================================================================================
+SUMMARY
+================================================================================
+
+Total GT boxes: 550
+Total Predictions: 830
+Successful Matches: 82 (14.9% recall)
+
+Failure breakdown:
+  no_predictions: 3 (0.5%)
+  wrong_class: 616 (112.0%)
+  low_iou: 131 (23.8%)
+  already_matched: 1 (0.2%)
+
+Per-class statistics:
+Class           GT     Pred   TP     FP     FN     Precision  Recall     AP
+-------------------------------------------------------------------------------------
+go              255    434    14     420    241    0.032      0.055      0.002
+goLeft          6      1      0      1      6      0.000      0.000      0.000
+stop            188    276    44     232    144    0.159      0.234      0.037
+stopLeft        78     70     24     46     54     0.343      0.308      0.105
+warning         18     49     0      49     18     0.000      0.000      0.000
+warningLeft     5      0      0      0      5      0.000      0.000      0.000
+
+IoU distribution (all pred-GT pairs of same class):
+  Mean: 0.027
+  Median: 0.000
+  <0.3: 96.0%
+  0.3-0.5: 3.0%
+  >=0.5: 1.0%
+
+================================================================================
+FINAL mAP @ IoU=0.25: 0.024
+================================================================================
+
+
+Epoch 2: val_mAP=0.024
+Visualization saved: detection_results-20251219-230737.png
+Epoch 2: detection preview saved
+1813/1813 ━━━━━━━━━━━━━━━━━━━━ 3032s 2s/step - lambda: 0.4300 - loss: 0.9022 - val_lambda: 0.2951 - val_loss: 1.0700 - learning_rate: 0.0010 - val_mAP: 0.0241
